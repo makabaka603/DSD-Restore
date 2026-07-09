@@ -1,0 +1,42 @@
+experiment:
+  name: v1_minimal
+  output_dir: experiments/v1_minimal
+  seed: 42
+
+model:
+  in_channels: 3
+  out_channels: 3
+  base_channels: 32
+  token_dim: 64
+  num_dense_tokens: 5
+  num_sparse_tokens: 4
+
+data:
+  train_input_dir: data/mixed/train/input
+  train_gt_dir: data/mixed/train/gt
+  train_metadata: data/mixed/train/metadata.json
+  val_input_dir: data/mixed/val/input
+  val_gt_dir: data/mixed/val/gt
+  val_metadata: data/mixed/val/metadata.json
+  crop_size: 256
+  batch_size: 4
+  num_workers: 0
+
+optimization:
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0001
+  min_lr: 0.000001
+  warmup_epochs: 3
+
+loss:
+  lambda_rec: 1.0
+  lambda_ssim: 0.2
+  lambda_freq: 0.05
+  lambda_color: 0.05
+  lambda_cls: 0.05
+
+runtime:
+  device: auto
+  amp: false
+  save_every: 10
