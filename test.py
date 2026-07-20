@@ -3,7 +3,7 @@ import argparse
 import torch
 from torch.utils.data import DataLoader
 
-from datasets import PairedRestorationDataset
+from datasets import PairedRestorationDataset, build_source_dataset
 from metrics import batch_psnr, batch_ssim
 from models import DSDRestoreV1
 from utils.config import load_config
@@ -25,26 +25,43 @@ def main() -> None:
         cfg["runtime"].get("amp", False),
         cfg["runtime"].get("amp_dtype", "bfloat16"),
     )
-    dataset = PairedRestorationDataset(
-        cfg["data"]["val_input_dir"],
-        cfg["data"]["val_gt_dir"],
-        cfg["data"].get("val_metadata"),
-        training=False,
-    )
+    if cfg["data"].get("val_sources"):
+        dataset, _ = build_source_dataset(
+            cfg["data"]["val_sources"],
+            crop_size=None,
+            training=False,
+            seed=cfg["experiment"].get("seed", 42),
+        )
+    else:
+        dataset = PairedRestorationDataset(
+            cfg["data"]["val_input_dir"],
+            cfg["data"]["val_gt_dir"],
+            cfg["data"].get("val_metadata"),
+            training=False,
+        )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
     model = DSDRestoreV1(**cfg["model"]).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
-    psnr_values, ssim_values = [], []
+    task_values = {}
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(batch["input"])
-        psnr_values.append(batch_psnr(outputs["restored"], batch["gt"]))
-        ssim_values.append(batch_ssim(outputs["restored"], batch["gt"]))
-    print(f"PSNR: {sum(psnr_values) / len(psnr_values):.3f}")
-    print(f"SSIM: {sum(ssim_values) / len(ssim_values):.4f}")
+        task = batch.get("task", ["mixed"])[0]
+        values = task_values.setdefault(task, {"psnr": [], "ssim": []})
+        values["psnr"].append(batch_psnr(outputs["restored"], batch["gt"]))
+        values["ssim"].append(batch_ssim(outputs["restored"], batch["gt"]))
+    macro_psnr, macro_ssim = 0.0, 0.0
+    for task, values in task_values.items():
+        psnr = sum(values["psnr"]) / len(values["psnr"])
+        ssim = sum(values["ssim"]) / len(values["ssim"])
+        macro_psnr += psnr
+        macro_ssim += ssim
+        print(f"{task}: count={len(values['psnr'])} PSNR={psnr:.3f} SSIM={ssim:.4f}")
+    print(f"Macro PSNR: {macro_psnr / len(task_values):.3f}")
+    print(f"Macro SSIM: {macro_ssim / len(task_values):.4f}")
 
 
 if __name__ == "__main__":

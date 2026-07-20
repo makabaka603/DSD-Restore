@@ -13,6 +13,8 @@ env/
 
 data/
 datasets_raw/
+# Raw datasets live beside the loader code locally and must never be committed.
+/datasets/*/
 experiments/
 results/
 checkpoints/

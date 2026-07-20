@@ -12,13 +12,98 @@ model:
   num_sparse_tokens: 4
 
 data:
-  train_input_dir: data/mixed/train/input
-  train_gt_dir: data/mixed/train/gt
-  train_metadata: data/mixed/train/metadata.json
-  val_input_dir: data/mixed/val/input
-  val_gt_dir: data/mixed/val/gt
-  val_metadata: data/mixed/val/metadata.json
   crop_size: 256
+  # 1,000 optimizer steps per logical epoch. Sampling is with replacement,
+  # so source probability is independent of the number of files it contains.
+  samples_per_epoch: 16000
+  train_sources:
+    - name: snow100k
+      input_dir: datasets/Snow100K/train/input
+      gt_dir: datasets/Snow100K/train/gt
+      task: snow
+      probability: 0.20
+    - name: rain13k
+      input_dir: datasets/Rain13K/train/input
+      gt_dir: datasets/Rain13K/train/target
+      task: rain
+      probability: 0.20
+    - name: reside6k
+      input_dir: datasets/RESIDE-6K/train/hazy
+      gt_dir: datasets/RESIDE-6K/train/GT
+      task: haze
+      probability: 0.20
+    - name: lolv2_real
+      input_dir: datasets/LOLv2_real/Train/Input
+      gt_dir: datasets/LOLv2_real/Train/GT
+      task: lowlight
+      probability: 0.125
+    - name: lolv2_synthetic
+      input_dir: datasets/LOLv2_synthetic/Train/Input
+      gt_dir: datasets/LOLv2_synthetic/Train/GT
+      task: lowlight
+      probability: 0.125
+    - name: div2k_dust
+      clean_dir: datasets/DIV2K_train_HR
+      synthetic: dust
+      task: dust
+      probability: 0.05
+    - name: div2k_sand
+      clean_dir: datasets/DIV2K_train_HR
+      synthetic: sand
+      task: sand
+      probability: 0.05
+    - name: div2k_colorcast
+      clean_dir: datasets/DIV2K_train_HR
+      synthetic: colorcast
+      task: colorcast
+      probability: 0.05
+
+  # Validation is capped per task and reported as a macro average, preventing
+  # large datasets from dominating checkpoint selection.
+  val_sources:
+    - name: snow100k_val
+      input_dir: datasets/Snow100K/val/input
+      gt_dir: datasets/Snow100K/val/gt
+      task: snow
+      max_samples: 100
+    - name: rain13k_val
+      input_dir: datasets/Rain13K/test/Test100/input
+      gt_dir: datasets/Rain13K/test/Test100/target
+      task: rain
+      max_samples: 100
+    - name: reside6k_val
+      input_dir: datasets/RESIDE-6K/test/hazy
+      gt_dir: datasets/RESIDE-6K/test/GT
+      task: haze
+      max_samples: 100
+    - name: lolv2_real_val
+      input_dir: datasets/LOLv2_real/Test/Input
+      gt_dir: datasets/LOLv2_real/Test/GT
+      task: lowlight
+      max_samples: 100
+    - name: lolv2_synthetic_val
+      input_dir: datasets/LOLv2_synthetic/Test/Input
+      gt_dir: datasets/LOLv2_synthetic/Test/GT
+      # The official test inputs have an extra leading "r" absent from GT names.
+      gt_strip_input_prefix: r
+      task: lowlight
+      max_samples: 100
+    - name: div2k_dust_val
+      clean_dir: datasets/DIV2K_valid_HR
+      synthetic: dust
+      task: dust
+      max_samples: 100
+    - name: div2k_sand_val
+      clean_dir: datasets/DIV2K_valid_HR
+      synthetic: sand
+      task: sand
+      max_samples: 100
+    - name: div2k_colorcast_val
+      clean_dir: datasets/DIV2K_valid_HR
+      synthetic: colorcast
+      task: colorcast
+      max_samples: 100
+
   # RTX 5090 (32 GB) baseline. Reduce to 8 if the real data pipeline runs OOM.
   batch_size: 16
   num_workers: 4

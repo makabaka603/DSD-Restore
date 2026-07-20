@@ -62,29 +62,47 @@ python scripts/smoke_test_v1.py
 
 ## Data
 
-Prepare paired data as:
+The default configuration reads each dataset in place. Do not copy everything
+into one mixed folder: source-balanced sampling prevents Snow100K from dominating
+smaller datasets and avoids filename collisions.
 
 ```text
-data/mixed/train/input/*.png
-data/mixed/train/gt/*.png
-data/mixed/val/input/*.png
-data/mixed/val/gt/*.png
+datasets/
+  Snow100K/{train,val}/{input,gt}/
+  Rain13K/train/{input,target}/
+  Rain13K/test/Test100/{input,target}/
+  RESIDE-6K/{train,test}/{hazy,GT}/
+  LOLv2_real/{Train,Test}/{Input,GT}/
+  LOLv2_synthetic/{Train,Test}/{Input,GT}/
+  DIV2K_train_HR/
+  DIV2K_valid_HR/
+  Dusty Images Dataset/       # real inference only; never paired by folder order
 ```
 
-Degradation labels can be stored in `metadata.json`:
+Training probabilities are configured independently from dataset sizes:
 
-```json
-{
-  "0001.png": {"dust": 0.6, "haze": 0.3, "lowlight": 0.5, "rain": 0.2, "snow": 0.0}
-}
+| Source | Probability |
+| --- | ---: |
+| Snow100K | 20% |
+| Rain13K | 20% |
+| RESIDE-6K | 20% |
+| LOLv2 real + synthetic | 25% |
+| DIV2K online dust/sand/color-cast synthesis | 15% |
+
+DIV2K images are clean targets. Dense degradation inputs are generated online,
+with fixed seeds for validation. Dusty Images has no verified same-scene clean
+targets, so it is reserved for qualitative real-image inference.
+
+Before a formal run, audit paths, train/validation leakage, sampling ratios, and
+every paired image size:
+
+```powershell
+python scripts/audit_training_data.py --check-sizes
+python scripts/preview_synthetic_degradations.py
 ```
 
-The default configuration enables degradation classification with `lambda_cls: 0.05`, so training metadata is required. The trainer stops with an explicit error instead of silently treating every sample as a zero label. If no reliable degradation labels are available, set this in the YAML file:
-
-```yaml
-loss:
-  lambda_cls: 0.0
-```
+Inspect `results/synthetic_preview.jpg` before training. A faster path-only audit
+can omit `--check-sizes`.
 
 ## Train
 
@@ -93,6 +111,9 @@ Start a new training run:
 ```powershell
 python train.py --config configs/train_v1_minimal.yaml
 ```
+
+Validation reports PSNR and SSIM per degradation task. The unweighted macro PSNR
+is used for selecting `best.pt`, so no large validation source dominates it.
 
 Checkpoints are written to `experiments/v1_minimal/checkpoints/`:
 

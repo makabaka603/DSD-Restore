@@ -8,7 +8,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from datasets import PairedRestorationDataset
+from datasets import PairedRestorationDataset, build_balanced_sampler, build_source_dataset
 from losses import DSDRestoreV1Loss
 from metrics import batch_psnr, batch_ssim
 from models import DSDRestoreV1
@@ -25,6 +25,48 @@ from utils.runtime import (
 
 def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
     data = cfg["data"]
+    if data.get("train_sources"):
+        seed = cfg["experiment"].get("seed", 42)
+        train_set, train_sources = build_source_dataset(
+            data["train_sources"],
+            crop_size=data.get("crop_size"),
+            training=True,
+            seed=seed,
+        )
+        val_set, _ = build_source_dataset(
+            data["val_sources"],
+            crop_size=None,
+            training=False,
+            seed=seed,
+        )
+        samples_per_epoch = data.get("samples_per_epoch", data["batch_size"] * 1000)
+        sampler = build_balanced_sampler(
+            train_sources,
+            data["train_sources"],
+            num_samples=samples_per_epoch,
+            seed=seed,
+        )
+        num_workers = data.get("num_workers", 0)
+        loader_kwargs = {
+            "batch_size": data["batch_size"],
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "pin_memory": True,
+            "persistent_workers": data.get("persistent_workers", True) and num_workers > 0,
+            "drop_last": True,
+        }
+        if num_workers > 0:
+            loader_kwargs["prefetch_factor"] = data.get("prefetch_factor", 2)
+        train_loader = DataLoader(train_set, **loader_kwargs)
+        val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+        print("Training sources:")
+        for source, source_cfg in zip(train_sources, data["train_sources"]):
+            print(
+                f"  {source.name}: {len(source)} images, "
+                f"probability={float(source_cfg['probability']):.1%}"
+            )
+        return train_loader, val_loader
+
     train_set = PairedRestorationDataset(
         data["train_input_dir"],
         data["train_gt_dir"],
@@ -64,16 +106,28 @@ def validate(
     device: torch.device,
     amp_enabled: bool,
     amp_dtype: torch.dtype,
-) -> dict[str, float]:
+) -> dict[str, float | dict[str, dict[str, float]]]:
     model.eval()
-    psnr_values, ssim_values = [], []
+    task_values: dict[str, dict[str, list[float]]] = {}
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(batch["input"])
-        psnr_values.append(batch_psnr(outputs["restored"], batch["gt"]))
-        ssim_values.append(batch_ssim(outputs["restored"], batch["gt"]))
-    return {"psnr": sum(psnr_values) / len(psnr_values), "ssim": sum(ssim_values) / len(ssim_values)}
+        task = batch.get("task", ["mixed"])[0]
+        values = task_values.setdefault(task, {"psnr": [], "ssim": []})
+        values["psnr"].append(batch_psnr(outputs["restored"], batch["gt"]))
+        values["ssim"].append(batch_ssim(outputs["restored"], batch["gt"]))
+    per_task = {
+        task: {
+            "psnr": sum(values["psnr"]) / len(values["psnr"]),
+            "ssim": sum(values["ssim"]) / len(values["ssim"]),
+            "count": len(values["psnr"]),
+        }
+        for task, values in task_values.items()
+    }
+    macro_psnr = sum(values["psnr"] for values in per_task.values()) / len(per_task)
+    macro_ssim = sum(values["ssim"] for values in per_task.values()) / len(per_task)
+    return {"psnr": macro_psnr, "ssim": macro_ssim, "per_task": per_task}
 
 
 def build_scheduler(optim: AdamW, max_iters: int, warmup_iters: int, min_lr: float) -> LambdaLR:
@@ -134,7 +188,7 @@ def train(cfg: dict, resume: str | None = None) -> None:
     train_loader, val_loader = build_loaders(cfg)
 
     metadata_path = cfg["data"].get("train_metadata")
-    if cfg["loss"].get("lambda_cls", 0.0) > 0 and (
+    if not cfg["data"].get("train_sources") and cfg["loss"].get("lambda_cls", 0.0) > 0 and (
         not metadata_path or not Path(metadata_path).exists()
     ):
         raise FileNotFoundError(
@@ -214,9 +268,14 @@ def train(cfg: dict, resume: str | None = None) -> None:
             if should_validate:
                 last_metrics = validate(model, val_loader, device, amp_enabled, amp_dtype)
                 print(
-                    f"iteration={global_step} psnr={last_metrics['psnr']:.3f} "
-                    f"ssim={last_metrics['ssim']:.4f}"
+                    f"iteration={global_step} macro_psnr={last_metrics['psnr']:.3f} "
+                    f"macro_ssim={last_metrics['ssim']:.4f}"
                 )
+                for task, task_metrics in last_metrics.get("per_task", {}).items():
+                    print(
+                        f"  {task}: count={task_metrics['count']} "
+                        f"psnr={task_metrics['psnr']:.3f} ssim={task_metrics['ssim']:.4f}"
+                    )
                 if last_metrics["psnr"] > best_psnr:
                     best_psnr = last_metrics["psnr"]
                     best_step = global_step
