@@ -108,9 +108,13 @@ def validate(
     amp_enabled: bool,
     amp_dtype: torch.dtype,
     perceptual: PerceptualMetrics,
+    compute_perceptual: bool = True,
+    perceptual_max_samples_per_source: int = 0,
+    perceptual_max_size: int | None = None,
 ) -> dict[str, float | dict[str, dict[str, float]]]:
     model.eval()
     task_values: dict[str, dict[str, list[float]]] = {}
+    perceptual_source_counts: dict[str, int] = {}
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
@@ -119,30 +123,45 @@ def validate(
         values = task_values.setdefault(task, {"psnr": [], "ssim": [], "lpips": [], "dists": []})
         values["psnr"].append(batch_psnr(outputs["restored"], batch["gt"]))
         values["ssim"].append(batch_ssim(outputs["restored"], batch["gt"]))
-        perceptual_values = perceptual(outputs["restored"], batch["gt"])
-        values["lpips"].append(perceptual_values["lpips"])
-        values["dists"].append(perceptual_values["dists"])
-    per_task = {
-        task: {
+        source = batch.get("source", [task])[0]
+        source_count = perceptual_source_counts.get(source, 0)
+        should_measure_perceptual = compute_perceptual and (
+            perceptual_max_samples_per_source <= 0
+            or source_count < perceptual_max_samples_per_source
+        )
+        if should_measure_perceptual:
+            perceptual_values = perceptual(
+                outputs["restored"], batch["gt"], max_size=perceptual_max_size
+            )
+            values["lpips"].append(perceptual_values["lpips"])
+            values["dists"].append(perceptual_values["dists"])
+            perceptual_source_counts[source] = source_count + 1
+
+    per_task = {}
+    for task, values in task_values.items():
+        task_metrics = {
             "psnr": sum(values["psnr"]) / len(values["psnr"]),
             "ssim": sum(values["ssim"]) / len(values["ssim"]),
-            "lpips": sum(values["lpips"]) / len(values["lpips"]),
-            "dists": sum(values["dists"]) / len(values["dists"]),
             "count": len(values["psnr"]),
         }
-        for task, values in task_values.items()
-    }
+        if values["lpips"]:
+            task_metrics["lpips"] = sum(values["lpips"]) / len(values["lpips"])
+            task_metrics["dists"] = sum(values["dists"]) / len(values["dists"])
+            task_metrics["perceptual_count"] = len(values["lpips"])
+        per_task[task] = task_metrics
+
     macro_psnr = sum(values["psnr"] for values in per_task.values()) / len(per_task)
     macro_ssim = sum(values["ssim"] for values in per_task.values()) / len(per_task)
-    macro_lpips = sum(values["lpips"] for values in per_task.values()) / len(per_task)
-    macro_dists = sum(values["dists"] for values in per_task.values()) / len(per_task)
-    return {
+    result = {
         "psnr": macro_psnr,
         "ssim": macro_ssim,
-        "lpips": macro_lpips,
-        "dists": macro_dists,
         "per_task": per_task,
     }
+    perceptual_tasks = [values for values in per_task.values() if "lpips" in values]
+    if perceptual_tasks:
+        result["lpips"] = sum(values["lpips"] for values in perceptual_tasks) / len(perceptual_tasks)
+        result["dists"] = sum(values["dists"] for values in perceptual_tasks) / len(perceptual_tasks)
+    return result
 
 
 def prepare_tensorboard_dir(cfg: dict) -> Path:
@@ -174,7 +193,8 @@ def is_better(value: float, best: float, metric: str) -> bool:
 
 def write_metrics(writer: object, prefix: str, metrics: dict, step: int) -> None:
     for name in ("psnr", "ssim", "lpips", "dists"):
-        writer.add_scalar(f"{prefix}/{name}", metrics[name], step)
+        if name in metrics:
+            writer.add_scalar(f"{prefix}/{name}", metrics[name], step)
 
 
 def build_scheduler(optim: AdamW, max_iters: int, warmup_iters: int, min_lr: float) -> LambdaLR:
@@ -338,13 +358,25 @@ def train(cfg: dict, resume: str | None = None) -> None:
     psnr_ssim_every = train_metrics_cfg.get("psnr_ssim_every_iters", 1)
     perceptual_every = train_metrics_cfg.get("perceptual_every_iters", 100)
     perceptual_samples = train_metrics_cfg.get("perceptual_batch_samples", 4)
+    val_perceptual_every = cfg["runtime"].get("val_perceptual_every_iters", 1000)
+    val_perceptual_samples = cfg["runtime"].get("val_perceptual_max_samples_per_source", 2)
+    val_perceptual_max_size = cfg["runtime"].get("val_perceptual_max_size", 256)
     early_stop_patience = cfg["runtime"].get("early_stop_patience_iters", 0)
-    if min(val_every, save_every, window_every, psnr_ssim_every, perceptual_every, perceptual_samples) <= 0:
+    if min(
+        val_every, save_every, window_every, psnr_ssim_every, perceptual_every,
+        perceptual_samples, val_perceptual_every, val_perceptual_samples,
+        val_perceptual_max_size,
+    ) <= 0:
         raise ValueError("validation, save, metric, sample, and best-window values must be greater than zero.")
     if val_every > window_every or window_every % val_every != 0:
         raise ValueError(
             "best_window_iters must be an exact multiple of val_every_iters so every "
             "checkpoint window contains comparable validation measurements."
+        )
+    if selection_metric in {"lpips", "dists"} and val_perceptual_every != val_every:
+        raise ValueError(
+            "LPIPS/DISTS checkpoint selection requires val_perceptual_every_iters "
+            "to equal val_every_iters."
         )
     stop_training = False
     window_best = math.inf if selection_metric in {"lpips", "dists"} else -math.inf
@@ -396,23 +428,41 @@ def train(cfg: dict, resume: str | None = None) -> None:
 
             should_validate = global_step % val_every == 0 or global_step == max_iters
             if should_validate:
-                last_metrics = validate(model, val_loader, device, amp_enabled, amp_dtype, perceptual)
-                write_metrics(writer, "val", last_metrics, global_step)
-                for task, task_metrics in last_metrics.get("per_task", {}).items():
-                    write_metrics(writer, f"val_by_task/{task}", task_metrics, global_step)
-                print(
-                    f"iteration={global_step} macro_psnr={last_metrics['psnr']:.3f} "
-                    f"macro_ssim={last_metrics['ssim']:.4f} "
-                    f"macro_lpips={last_metrics['lpips']:.4f} macro_dists={last_metrics['dists']:.4f}"
+                measure_val_perceptual = global_step % val_perceptual_every == 0
+                current_metrics = validate(
+                    model, val_loader, device, amp_enabled, amp_dtype, perceptual,
+                    compute_perceptual=measure_val_perceptual,
+                    perceptual_max_samples_per_source=val_perceptual_samples,
+                    perceptual_max_size=val_perceptual_max_size,
                 )
-                for task, task_metrics in last_metrics.get("per_task", {}).items():
-                    print(
-                        f"  {task}: count={task_metrics['count']} "
-                        f"psnr={task_metrics['psnr']:.3f} ssim={task_metrics['ssim']:.4f} "
-                        f"lpips={task_metrics['lpips']:.4f} dists={task_metrics['dists']:.4f}"
+                write_metrics(writer, "val", current_metrics, global_step)
+                for task, task_metrics in current_metrics.get("per_task", {}).items():
+                    write_metrics(writer, f"val_by_task/{task}", task_metrics, global_step)
+                message = (
+                    f"iteration={global_step} macro_psnr={current_metrics['psnr']:.3f} "
+                    f"macro_ssim={current_metrics['ssim']:.4f}"
+                )
+                if measure_val_perceptual:
+                    message += (
+                        f" macro_lpips={current_metrics['lpips']:.4f} "
+                        f"macro_dists={current_metrics['dists']:.4f}"
                     )
-                if is_better(last_metrics[selection_metric], best_value, selection_metric):
-                    best_value = last_metrics[selection_metric]
+                print(message)
+                for task, task_metrics in current_metrics.get("per_task", {}).items():
+                    task_message = (
+                        f"  {task}: count={task_metrics['count']} "
+                        f"psnr={task_metrics['psnr']:.3f} ssim={task_metrics['ssim']:.4f}"
+                    )
+                    if "lpips" in task_metrics:
+                        task_message += (
+                            f" lpips={task_metrics['lpips']:.4f} "
+                            f"dists={task_metrics['dists']:.4f} "
+                            f"perceptual_count={task_metrics['perceptual_count']}"
+                        )
+                    print(task_message)
+                last_metrics = {**last_metrics, **current_metrics}
+                if is_better(current_metrics[selection_metric], best_value, selection_metric):
+                    best_value = current_metrics[selection_metric]
                     best_step = global_step
                     save_weights(ckpt_dir / "best.pth", model, cfg, global_step, last_metrics)
                 elif early_stop_patience > 0 and global_step - best_step >= early_stop_patience:

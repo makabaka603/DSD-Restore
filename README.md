@@ -117,6 +117,9 @@ Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. The unweig
 is used for selecting `best.pth`, so no large validation source dominates it.
 Frequent validation uses at most 10 images per configured source. `test.py`
 removes this cap by default and evaluates every available test image.
+PSNR/SSIM validation and checkpoint selection run every 100 iterations;
+LPIPS/DISTS validation runs every 1,000 iterations on at most 2 images per
+source, resized proportionally to a maximum side of 256 pixels.
 
 TensorBoard event files are opened through `/root/tf-logs`, which the trainer
 creates as a symbolic link to `/root/autodl-tmp/tf-logs`. The files therefore

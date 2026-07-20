@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 class PerceptualMetrics:
@@ -27,10 +28,20 @@ class PerceptualMetrics:
                 parameter.requires_grad_(False)
 
     @torch.no_grad()
-    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    def __call__(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        max_size: int | None = None,
+    ) -> dict[str, float]:
         # LPIPS expects [-1, 1]; DISTS expects ImageNet-style RGB in [0, 1].
         pred = pred.detach().float().clamp(0, 1)
         target = target.detach().float().clamp(0, 1)
+        if max_size and max(pred.shape[-2:]) > max_size:
+            scale = max_size / max(pred.shape[-2:])
+            size = tuple(max(1, round(length * scale)) for length in pred.shape[-2:])
+            pred = F.interpolate(pred, size=size, mode="bilinear", align_corners=False)
+            target = F.interpolate(target, size=size, mode="bilinear", align_corners=False)
         lpips_value = self.lpips(pred * 2 - 1, target * 2 - 1).mean()
         dists_value = self.dists(pred, target).mean()
         return {"lpips": float(lpips_value.item()), "dists": float(dists_value.item())}

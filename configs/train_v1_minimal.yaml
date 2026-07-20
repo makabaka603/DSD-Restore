@@ -136,6 +136,10 @@ runtime:
   cudnn_benchmark: true
   # Per-iteration train metrics go to TensorBoard; validation selects weights.
   val_every_iters: 100
+  # LPIPS/DISTS validation is deliberately sparser and uses small images.
+  val_perceptual_every_iters: 1000
+  val_perceptual_max_samples_per_source: 2
+  val_perceptual_max_size: 256
   best_window_iters: 100
   selection_metric: psnr
   train_metrics:
