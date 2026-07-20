@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 
@@ -55,9 +56,21 @@ class PairedRestorationDataset(Dataset):
         }
 
     def _paired_transform(self, image: Image.Image, target: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
+        if image.size != target.size:
+            raise ValueError(
+                f"Input/GT size mismatch before paired transform: input={image.size}, gt={target.size}"
+            )
         if self.training and self.crop_size:
             w, h = image.size
-            crop = min(self.crop_size, w, h)
+            crop = self.crop_size
+            if min(w, h) < crop:
+                scale = crop / min(w, h)
+                resized_w = max(crop, round(w * scale))
+                resized_h = max(crop, round(h * scale))
+                size = [resized_h, resized_w]
+                image = TF.resize(image, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
+                target = TF.resize(target, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
+                w, h = image.size
             left = random.randint(0, max(0, w - crop))
             top = random.randint(0, max(0, h - crop))
             image = TF.crop(image, top, left, crop, crop)
