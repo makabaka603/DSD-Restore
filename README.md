@@ -48,8 +48,10 @@ The default settings are stored in `configs/train_v1_minimal.yaml`:
 | Optimizer | AdamW | Learning rate `2e-4`, weight decay `1e-4` |
 | Scheduler | Cosine decay | Minimum learning rate `1e-6` |
 | Mixed precision | BF16 AMP | Automatically falls back to FP16 if BF16 is unavailable |
-| Training metrics | PSNR/SSIM every iteration | LPIPS/DISTS every 100 iterations on 4 samples |
-| Validation | Every 100 iterations | Selects weights on a fixed validation set |
+| Training metrics | PSNR/SSIM every iteration | GPU values synchronize every 20 iterations |
+| Perceptual metrics | Every 100 iterations | LPIPS/DISTS on 4 training samples |
+| Probe validation | Every 100 iterations | 2 fixed 256px center crops per source |
+| Selection validation | Every 500 iterations | 10 fixed 256px center crops per source |
 | Checkpoint | Every 100 iterations | Best validated state in each 100-iteration window |
 | Early stopping | 15,000 iterations | Stops if validation PSNR does not improve |
 
@@ -113,13 +115,26 @@ Start a new training run:
 python train.py --config configs/train_v1_minimal.yaml
 ```
 
-Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. The unweighted macro PSNR
-is used for selecting `best.pth`, so no large validation source dominates it.
-Frequent validation uses at most 10 images per configured source. `test.py`
-removes this cap by default and evaluates every available test image.
-PSNR/SSIM validation and checkpoint selection run every 100 iterations;
+Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. A small,
+deterministic probe set runs every 100 iterations and saves the corresponding
+window checkpoint. The unweighted macro PSNR from the larger selection set,
+evaluated every 500 iterations, selects `best.pth`, so no large source dominates.
 LPIPS/DISTS validation runs every 1,000 iterations on at most 2 images per
-source, resized proportionally to a maximum side of 256 pixels.
+source. Frequent validation uses fixed 256px center crops; `test.py` removes all
+caps and evaluates every available full-resolution test image.
+
+Training uses eight persistent data workers, four-batch prefetching, BF16,
+channels-last tensors, and optional `torch.compile`. Per-iteration TensorBoard
+points are buffered and synchronized every 20 iterations to avoid a CPU/GPU
+barrier after every optimizer step. The `timing/*` TensorBoard series report
+data wait, GPU training, metric, validation, checkpoint, and throughput timing.
+
+Create and run a representative 200-iteration benchmark before a formal run:
+
+```bash
+python scripts/make_benchmark_config.py --iters 200
+/usr/bin/time -p python train.py --config /tmp/dsd_benchmark.yaml
+```
 
 TensorBoard event files are opened through `/root/tf-logs`, which the trainer
 creates as a symbolic link to `/root/autodl-tmp/tf-logs`. The files therefore

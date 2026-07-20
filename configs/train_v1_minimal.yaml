@@ -13,6 +13,9 @@ model:
 
 data:
   crop_size: 256
+  # Frequent validation uses the same spatial scale as training. Final test.py
+  # still evaluates uncropped full-resolution images.
+  val_crop_size: 256
   # 1,000 optimizer steps per logical epoch. Sampling is with replacement,
   # so source probability is independent of the number of files it contains.
   samples_per_epoch: 16000
@@ -106,9 +109,11 @@ data:
 
   # RTX 5090 (32 GB) baseline. Reduce to 8 if the real data pipeline runs OOM.
   batch_size: 16
-  num_workers: 4
+  num_workers: 8
   persistent_workers: true
-  prefetch_factor: 2
+  prefetch_factor: 4
+  val_num_workers: 4
+  val_prefetch_factor: 2
 
 optimization:
   # Iteration-based training is independent of the number of training images.
@@ -134,8 +139,19 @@ runtime:
   amp: true
   amp_dtype: bfloat16
   cudnn_benchmark: true
+  channels_last: true
+  compile:
+    enabled: true
+    mode: max-autotune-no-cudagraphs
+    dynamic: false
+  # TensorBoard retains every iteration; values are synchronized in batches to
+  # avoid forcing the GPU to wait for Python after every optimizer step.
+  log_every_iters: 20
   # Per-iteration train metrics go to TensorBoard; validation selects weights.
   val_every_iters: 100
+  probe_val_max_samples_per_source: 2
+  selection_val_every_iters: 500
+  selection_val_max_samples_per_source: 10
   # LPIPS/DISTS validation is deliberately sparser and uses small images.
   val_perceptual_every_iters: 1000
   val_perceptual_max_samples_per_source: 2

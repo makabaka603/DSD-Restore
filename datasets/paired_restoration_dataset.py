@@ -60,7 +60,7 @@ class PairedRestorationDataset(Dataset):
             raise ValueError(
                 f"Input/GT size mismatch before paired transform: input={image.size}, gt={target.size}"
             )
-        if self.training and self.crop_size:
+        if self.crop_size:
             w, h = image.size
             crop = self.crop_size
             if min(w, h) < crop:
@@ -71,16 +71,21 @@ class PairedRestorationDataset(Dataset):
                 image = TF.resize(image, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
                 target = TF.resize(target, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
                 w, h = image.size
-            left = random.randint(0, max(0, w - crop))
-            top = random.randint(0, max(0, h - crop))
+            if self.training:
+                left = random.randint(0, max(0, w - crop))
+                top = random.randint(0, max(0, h - crop))
+            else:
+                left = max(0, (w - crop) // 2)
+                top = max(0, (h - crop) // 2)
             image = TF.crop(image, top, left, crop, crop)
             target = TF.crop(target, top, left, crop, crop)
-            if random.random() < 0.5:
-                image = TF.hflip(image)
-                target = TF.hflip(target)
-            if random.random() < 0.5:
-                image = TF.vflip(image)
-                target = TF.vflip(target)
+            if self.training:
+                if random.random() < 0.5:
+                    image = TF.hflip(image)
+                    target = TF.hflip(target)
+                if random.random() < 0.5:
+                    image = TF.vflip(image)
+                    target = TF.vflip(target)
         return TF.to_tensor(image), TF.to_tensor(target)
 
     def _labels(self, name: str) -> dict[str, torch.Tensor]:

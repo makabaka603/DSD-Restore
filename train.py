@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -11,7 +12,11 @@ from tqdm import tqdm
 
 from datasets import PairedRestorationDataset, build_balanced_sampler, build_source_dataset
 from losses import DSDRestoreV1Loss
-from metrics import PerceptualMetrics, batch_psnr, batch_ssim
+from metrics import (
+    PerceptualMetrics,
+    batch_psnr_tensor,
+    batch_ssim_tensor,
+)
 from models import DSDRestoreV1
 from utils.config import load_config
 from utils.runtime import (
@@ -36,7 +41,7 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         )
         val_set, _ = build_source_dataset(
             data["val_sources"],
-            crop_size=None,
+            crop_size=data.get("val_crop_size"),
             training=False,
             seed=seed,
         )
@@ -59,7 +64,17 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         if num_workers > 0:
             loader_kwargs["prefetch_factor"] = data.get("prefetch_factor", 2)
         train_loader = DataLoader(train_set, **loader_kwargs)
-        val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+        val_workers = data.get("val_num_workers", min(4, num_workers))
+        val_kwargs = {
+            "batch_size": 1,
+            "shuffle": False,
+            "num_workers": val_workers,
+            "pin_memory": True,
+            "persistent_workers": data.get("persistent_workers", True) and val_workers > 0,
+        }
+        if val_workers > 0:
+            val_kwargs["prefetch_factor"] = data.get("val_prefetch_factor", 2)
+        val_loader = DataLoader(val_set, **val_kwargs)
         print("Training sources:")
         for source, source_cfg in zip(train_sources, data["train_sources"]):
             print(
@@ -79,7 +94,7 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         data["val_input_dir"],
         data["val_gt_dir"],
         data.get("val_metadata"),
-        crop_size=None,
+        crop_size=data.get("val_crop_size"),
         training=False,
     )
     num_workers = data.get("num_workers", 0)
@@ -96,8 +111,27 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         train_set,
         **loader_kwargs,
     )
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    val_workers = data.get("val_num_workers", min(4, num_workers))
+    val_kwargs = {
+        "batch_size": 1,
+        "shuffle": False,
+        "num_workers": val_workers,
+        "pin_memory": True,
+        "persistent_workers": data.get("persistent_workers", True) and val_workers > 0,
+    }
+    if val_workers > 0:
+        val_kwargs["prefetch_factor"] = data.get("val_prefetch_factor", 2)
+    val_loader = DataLoader(val_set, **val_kwargs)
     return train_loader, val_loader
+
+
+def use_channels_last(batch: dict, enabled: bool) -> dict:
+    if enabled:
+        for key in ("input", "gt"):
+            value = batch.get(key)
+            if torch.is_tensor(value) and value.ndim == 4:
+                batch[key] = value.contiguous(memory_format=torch.channels_last)
+    return batch
 
 
 @torch.no_grad()
@@ -111,19 +145,26 @@ def validate(
     compute_perceptual: bool = True,
     perceptual_max_samples_per_source: int = 0,
     perceptual_max_size: int | None = None,
+    max_samples_per_source: int = 0,
+    channels_last: bool = False,
 ) -> dict[str, float | dict[str, dict[str, float]]]:
     model.eval()
     task_values: dict[str, dict[str, list[float]]] = {}
     perceptual_source_counts: dict[str, int] = {}
+    source_counts: dict[str, int] = {}
     for batch in loader:
-        batch = move_batch_to_device(batch, device)
+        task = batch.get("task", ["mixed"])[0]
+        source = batch.get("source", [task])[0]
+        source_count = source_counts.get(source, 0)
+        if max_samples_per_source > 0 and source_count >= max_samples_per_source:
+            continue
+        source_counts[source] = source_count + 1
+        batch = use_channels_last(move_batch_to_device(batch, device), channels_last)
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(batch["input"])
-        task = batch.get("task", ["mixed"])[0]
         values = task_values.setdefault(task, {"psnr": [], "ssim": [], "lpips": [], "dists": []})
-        values["psnr"].append(batch_psnr(outputs["restored"], batch["gt"]))
-        values["ssim"].append(batch_ssim(outputs["restored"], batch["gt"]))
-        source = batch.get("source", [task])[0]
+        values["psnr"].append(batch_psnr_tensor(outputs["restored"], batch["gt"]))
+        values["ssim"].append(batch_ssim_tensor(outputs["restored"], batch["gt"]))
         source_count = perceptual_source_counts.get(source, 0)
         should_measure_perceptual = compute_perceptual and (
             perceptual_max_samples_per_source <= 0
@@ -140,8 +181,8 @@ def validate(
     per_task = {}
     for task, values in task_values.items():
         task_metrics = {
-            "psnr": sum(values["psnr"]) / len(values["psnr"]),
-            "ssim": sum(values["ssim"]) / len(values["ssim"]),
+            "psnr": float(torch.stack(values["psnr"]).mean().item()),
+            "ssim": float(torch.stack(values["ssim"]).mean().item()),
             "count": len(values["psnr"]),
         }
         if values["lpips"]:
@@ -195,6 +236,57 @@ def write_metrics(writer: object, prefix: str, metrics: dict, step: int) -> None
     for name in ("psnr", "ssim", "lpips", "dists"):
         if name in metrics:
             writer.add_scalar(f"{prefix}/{name}", metrics[name], step)
+
+
+def flush_train_logs(
+    records: list[dict],
+    writer: object,
+    running_best: dict[str, float],
+    device: torch.device,
+    batch_size: int,
+    interval_started: float,
+) -> tuple[float, dict[str, float]]:
+    """Synchronize once, then emit every buffered per-iteration TensorBoard point."""
+    if not records:
+        return interval_started, {}
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed = max(time.perf_counter() - interval_started, 1e-9)
+    latest: dict[str, float] = {}
+    train_gpu_ms = []
+    metric_gpu_ms = []
+    for record in records:
+        step = record["step"]
+        loss = float(record["loss"].item())
+        latest["loss"] = loss
+        writer.add_scalar("train/loss", loss, step)
+        writer.add_scalar("train/learning_rate", record["lr"], step)
+        for name, raw_value in record["metrics"].items():
+            value = float(raw_value.item()) if torch.is_tensor(raw_value) else float(raw_value)
+            latest[name] = value
+            writer.add_scalar(f"train/current/{name}", value, step)
+            if is_better(value, running_best[name], name):
+                running_best[name] = value
+            writer.add_scalar(f"train/best/{name}", running_best[name], step)
+        if record.get("train_start") is not None:
+            train_gpu_ms.append(record["train_start"].elapsed_time(record["train_end"]))
+            metric_gpu_ms.append(record["train_end"].elapsed_time(record["metric_end"]))
+
+    last_step = records[-1]["step"]
+    writer.add_scalar(
+        "timing/data_wait_ms",
+        1000.0 * sum(record["data_wait_s"] for record in records) / len(records),
+        last_step,
+    )
+    writer.add_scalar("timing/interval_wall_s", elapsed, last_step)
+    writer.add_scalar(
+        "timing/train_images_per_s", len(records) * batch_size / elapsed, last_step
+    )
+    if train_gpu_ms:
+        writer.add_scalar("timing/train_gpu_ms", sum(train_gpu_ms) / len(train_gpu_ms), last_step)
+        writer.add_scalar("timing/metric_gpu_ms", sum(metric_gpu_ms) / len(metric_gpu_ms), last_step)
+    records.clear()
+    return time.perf_counter(), latest
 
 
 def build_scheduler(optim: AdamW, max_iters: int, warmup_iters: int, min_lr: float) -> LambdaLR:
@@ -299,7 +391,10 @@ def train(cfg: dict, resume: str | None = None) -> None:
             "Provide degradation labels or set loss.lambda_cls to 0.0."
         )
 
+    channels_last_enabled = cfg["runtime"].get("channels_last", False) and device.type == "cuda"
     model = DSDRestoreV1(**cfg["model"]).to(device)
+    if channels_last_enabled:
+        model = model.to(memory_format=torch.channels_last)
     perceptual = PerceptualMetrics(device)
     criterion = DSDRestoreV1Loss(**cfg["loss"])
     optim = AdamW(model.parameters(), lr=cfg["optimization"]["lr"], weight_decay=cfg["optimization"]["weight_decay"])
@@ -339,6 +434,21 @@ def train(cfg: dict, resume: str | None = None) -> None:
         running_best.update(checkpoint.get("running_best") or {})
         print(f"Resumed from {resume_path} at iteration {global_step}.")
 
+    active_model: torch.nn.Module = model
+    compile_cfg = cfg["runtime"].get("compile", {})
+    compile_enabled = compile_cfg.get("enabled", False) and device.type == "cuda"
+    if compile_enabled:
+        try:
+            active_model = torch.compile(
+                model,
+                mode=compile_cfg.get("mode", "max-autotune-no-cudagraphs"),
+                dynamic=compile_cfg.get("dynamic", False),
+            )
+            print(f"torch.compile enabled: mode={compile_cfg.get('mode', 'max-autotune-no-cudagraphs')}")
+        except Exception as exc:
+            active_model = model
+            print(f"torch.compile setup failed; continuing in eager mode: {exc}")
+
     # purge_step prevents a resumed run from displaying stale duplicate points
     # at and after the first newly written iteration.
     writer = SummaryWriter(
@@ -348,7 +458,8 @@ def train(cfg: dict, resume: str | None = None) -> None:
 
     print(
         f"device={device} amp={amp_enabled} amp_dtype={amp_dtype} "
-        f"batch_size={cfg['data']['batch_size']} max_iters={max_iters}"
+        f"batch_size={cfg['data']['batch_size']} max_iters={max_iters} "
+        f"channels_last={channels_last_enabled} compile={active_model is not model}"
     )
 
     val_every = cfg["runtime"].get("val_every_iters", 2000)
@@ -361,11 +472,16 @@ def train(cfg: dict, resume: str | None = None) -> None:
     val_perceptual_every = cfg["runtime"].get("val_perceptual_every_iters", 1000)
     val_perceptual_samples = cfg["runtime"].get("val_perceptual_max_samples_per_source", 2)
     val_perceptual_max_size = cfg["runtime"].get("val_perceptual_max_size", 256)
+    selection_val_every = cfg["runtime"].get("selection_val_every_iters", 500)
+    probe_val_samples = cfg["runtime"].get("probe_val_max_samples_per_source", 2)
+    selection_val_samples = cfg["runtime"].get("selection_val_max_samples_per_source", 10)
+    log_every = cfg["runtime"].get("log_every_iters", 20)
     early_stop_patience = cfg["runtime"].get("early_stop_patience_iters", 0)
     if min(
         val_every, save_every, window_every, psnr_ssim_every, perceptual_every,
         perceptual_samples, val_perceptual_every, val_perceptual_samples,
-        val_perceptual_max_size,
+        val_perceptual_max_size, selection_val_every, probe_val_samples,
+        selection_val_samples, log_every,
     ) <= 0:
         raise ValueError("validation, save, metric, sample, and best-window values must be greater than zero.")
     if val_every > window_every or window_every % val_every != 0:
@@ -373,6 +489,8 @@ def train(cfg: dict, resume: str | None = None) -> None:
             "best_window_iters must be an exact multiple of val_every_iters so every "
             "checkpoint window contains comparable validation measurements."
         )
+    if selection_val_every % val_every != 0:
+        raise ValueError("selection_val_every_iters must be a multiple of val_every_iters.")
     if selection_metric in {"lpips", "dists"} and val_perceptual_every != val_every:
         raise ValueError(
             "LPIPS/DISTS checkpoint selection requires val_perceptual_every_iters "
@@ -381,65 +499,124 @@ def train(cfg: dict, resume: str | None = None) -> None:
     stop_training = False
     window_best = math.inf if selection_metric in {"lpips", "dists"} else -math.inf
     active_window_start = ((global_step // window_every) * window_every) + 1
+    log_records: list[dict] = []
+    log_interval_started = time.perf_counter()
+    loader_ready_at = time.perf_counter()
+    compiled_step_verified = active_model is model
 
     while global_step < max_iters and not stop_training:
         epoch += 1
-        model.train()
+        active_model.train()
         remaining = max_iters - global_step
         pbar = tqdm(train_loader, total=min(len(train_loader), remaining), desc=f"Epoch {epoch}")
         for batch in pbar:
+            batch_received_at = time.perf_counter()
+            data_wait_s = batch_received_at - loader_ready_at
             if global_step >= max_iters:
                 break
-            batch = move_batch_to_device(batch, device)
+            batch = use_channels_last(move_batch_to_device(batch, device), channels_last_enabled)
+            train_start = train_end = metric_end = None
+            if device.type == "cuda":
+                train_start = torch.cuda.Event(enable_timing=True)
+                train_end = torch.cuda.Event(enable_timing=True)
+                metric_end = torch.cuda.Event(enable_timing=True)
+                train_start.record()
             optim.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
-                outputs = model(batch["input"])
-                losses = criterion(outputs, batch)
-            scaler.scale(losses["total"]).backward()
+            try:
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    outputs = active_model(batch["input"])
+                    losses = criterion(outputs, batch)
+                scaler.scale(losses["total"]).backward()
+                compiled_step_verified = True
+            except Exception as exc:
+                if compiled_step_verified or active_model is model:
+                    raise
+                print(f"torch.compile first step failed; falling back to eager mode: {exc}")
+                optim.zero_grad(set_to_none=True)
+                active_model = model
+                active_model.train()
+                with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+                    outputs = active_model(batch["input"])
+                    losses = criterion(outputs, batch)
+                scaler.scale(losses["total"]).backward()
+                compiled_step_verified = True
             scaler.step(optim)
             scaler.update()
             scheduler.step()
+            if train_end is not None:
+                train_end.record()
             global_step += 1
             restored = outputs["restored"].detach()
-            writer.add_scalar("train/loss", float(losses["total"].detach()), global_step)
-            writer.add_scalar("train/learning_rate", optim.param_groups[0]["lr"], global_step)
 
             train_metrics = {}
             if global_step % psnr_ssim_every == 0:
                 train_metrics.update(
-                    psnr=batch_psnr(restored, batch["gt"]),
-                    ssim=batch_ssim(restored, batch["gt"]),
+                    psnr=batch_psnr_tensor(restored, batch["gt"]),
+                    ssim=batch_ssim_tensor(restored, batch["gt"]),
                 )
             if global_step % perceptual_every == 0:
                 sample_count = min(perceptual_samples, restored.shape[0])
                 train_metrics.update(
                     perceptual(restored[:sample_count], batch["gt"][:sample_count])
                 )
-            for name, value in train_metrics.items():
-                writer.add_scalar(f"train/current/{name}", value, global_step)
-                if is_better(value, running_best[name], name):
-                    running_best[name] = value
-                writer.add_scalar(f"train/best/{name}", running_best[name], global_step)
-            pbar.set_postfix(
-                iteration=global_step,
-                loss=f"{float(losses['total'].detach()):.4f}",
-                lr=f"{optim.param_groups[0]['lr']:.2e}",
+            if metric_end is not None:
+                metric_end.record()
+            log_records.append(
+                {
+                    "step": global_step,
+                    "loss": losses["total"].detach(),
+                    "lr": optim.param_groups[0]["lr"],
+                    "metrics": train_metrics,
+                    "data_wait_s": data_wait_s,
+                    "train_start": train_start,
+                    "train_end": train_end,
+                    "metric_end": metric_end,
+                }
             )
 
             should_validate = global_step % val_every == 0 or global_step == max_iters
+            should_flush = global_step % log_every == 0 or should_validate
+            if should_flush:
+                log_interval_started, latest_log = flush_train_logs(
+                    log_records, writer, running_best, device,
+                    cfg["data"]["batch_size"], log_interval_started,
+                )
+                pbar.set_postfix(
+                    iteration=global_step,
+                    loss=f"{latest_log.get('loss', float('nan')):.4f}",
+                    lr=f"{optim.param_groups[0]['lr']:.2e}",
+                )
+
             if should_validate:
+                validation_started = time.perf_counter()
                 measure_val_perceptual = global_step % val_perceptual_every == 0
+                selection_validation = (
+                    global_step % selection_val_every == 0 or global_step == max_iters
+                )
+                val_sample_limit = (
+                    selection_val_samples if selection_validation else probe_val_samples
+                )
                 current_metrics = validate(
                     model, val_loader, device, amp_enabled, amp_dtype, perceptual,
                     compute_perceptual=measure_val_perceptual,
                     perceptual_max_samples_per_source=val_perceptual_samples,
                     perceptual_max_size=val_perceptual_max_size,
+                    max_samples_per_source=val_sample_limit,
+                    channels_last=channels_last_enabled,
                 )
-                write_metrics(writer, "val", current_metrics, global_step)
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
+                validation_seconds = time.perf_counter() - validation_started
+                writer.add_scalar("timing/validation_s", validation_seconds, global_step)
+                writer.add_scalar("validation/sample_limit_per_source", val_sample_limit, global_step)
+                val_prefix = "val" if selection_validation else "val_probe"
+                task_prefix = "val_by_task" if selection_validation else "val_probe_by_task"
+                write_metrics(writer, val_prefix, current_metrics, global_step)
                 for task, task_metrics in current_metrics.get("per_task", {}).items():
-                    write_metrics(writer, f"val_by_task/{task}", task_metrics, global_step)
+                    write_metrics(writer, f"{task_prefix}/{task}", task_metrics, global_step)
                 message = (
-                    f"iteration={global_step} macro_psnr={current_metrics['psnr']:.3f} "
+                    f"iteration={global_step} validation={('selection' if selection_validation else 'probe')} "
+                    f"macro_psnr={current_metrics['psnr']:.3f} "
                     f"macro_ssim={current_metrics['ssim']:.4f}"
                 )
                 if measure_val_perceptual:
@@ -461,11 +638,17 @@ def train(cfg: dict, resume: str | None = None) -> None:
                         )
                     print(task_message)
                 last_metrics = {**last_metrics, **current_metrics}
-                if is_better(current_metrics[selection_metric], best_value, selection_metric):
+                if selection_validation and is_better(
+                    current_metrics[selection_metric], best_value, selection_metric
+                ):
                     best_value = current_metrics[selection_metric]
                     best_step = global_step
                     save_weights(ckpt_dir / "best.pth", model, cfg, global_step, last_metrics)
-                elif early_stop_patience > 0 and global_step - best_step >= early_stop_patience:
+                elif (
+                    selection_validation
+                    and early_stop_patience > 0
+                    and global_step - best_step >= early_stop_patience
+                ):
                     print(
                         f"Early stopping at iteration {global_step}: validation {selection_metric} has not "
                         f"improved for {global_step - best_step} iterations."
@@ -486,9 +669,12 @@ def train(cfg: dict, resume: str | None = None) -> None:
                         ckpt_dir / f"window_{window_start:07d}_{window_end:07d}_best.pth",
                         model, cfg, global_step, last_metrics,
                     )
-                model.train()
+                active_model.train()
+                loader_ready_at = time.perf_counter()
+                log_interval_started = loader_ready_at
 
             if global_step % save_every == 0 or global_step == max_iters:
+                checkpoint_started = time.perf_counter()
                 save_checkpoint(
                     ckpt_dir / "latest.pth", model, optim, scheduler, scaler, cfg,
                     global_step, epoch, best_value, best_step, last_metrics, running_best,
@@ -497,6 +683,12 @@ def train(cfg: dict, resume: str | None = None) -> None:
                     ckpt_dir / f"iter_{global_step:07d}.pth", model, optim, scheduler, scaler, cfg,
                     global_step, epoch, best_value, best_step, last_metrics, running_best,
                 )
+                checkpoint_finished = time.perf_counter()
+                writer.add_scalar(
+                    "timing/checkpoint_s", checkpoint_finished - checkpoint_started, global_step
+                )
+                loader_ready_at = checkpoint_finished
+                log_interval_started = checkpoint_finished
 
             if stop_training:
                 save_checkpoint(
@@ -504,6 +696,7 @@ def train(cfg: dict, resume: str | None = None) -> None:
                     global_step, epoch, best_value, best_step, last_metrics, running_best,
                 )
                 break
+            loader_ready_at = time.perf_counter()
     writer.flush()
     writer.close()
 

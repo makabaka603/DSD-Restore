@@ -188,7 +188,7 @@ class RestorationSourceDataset(Dataset):
             raise ValueError(
                 f"{self.name}: input/GT size mismatch: input={image.size}, gt={target.size}"
             )
-        if self.training and self.crop_size:
+        if self.crop_size:
             width, height = image.size
             crop = self.crop_size
             if min(width, height) < crop:
@@ -197,14 +197,21 @@ class RestorationSourceDataset(Dataset):
                 image = TF.resize(image, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
                 target = TF.resize(target, size, interpolation=InterpolationMode.BICUBIC, antialias=True)
                 width, height = image.size
-            left = random.randint(0, max(0, width - crop))
-            top = random.randint(0, max(0, height - crop))
+            if self.training:
+                left = random.randint(0, max(0, width - crop))
+                top = random.randint(0, max(0, height - crop))
+            else:
+                # A fixed center crop makes frequent validation reproducible and
+                # prevents large 1K/2K images from dominating wall-clock time.
+                left = max(0, (width - crop) // 2)
+                top = max(0, (height - crop) // 2)
             image = TF.crop(image, top, left, crop, crop)
             target = TF.crop(target, top, left, crop, crop)
-            if random.random() < 0.5:
-                image, target = TF.hflip(image), TF.hflip(target)
-            if random.random() < 0.5:
-                image, target = TF.vflip(image), TF.vflip(target)
+            if self.training:
+                if random.random() < 0.5:
+                    image, target = TF.hflip(image), TF.hflip(target)
+                if random.random() < 0.5:
+                    image, target = TF.vflip(image), TF.vflip(target)
         return TF.to_tensor(image), TF.to_tensor(target)
 
 
