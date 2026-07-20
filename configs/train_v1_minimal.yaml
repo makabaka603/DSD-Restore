@@ -127,10 +127,22 @@ loss:
 
 runtime:
   device: auto
+  # LPIPS/DISTS pretrained backbones are cached on the data disk.
+  torch_home: /root/autodl-tmp/torch-cache
+  # Frequent weight snapshots must not fill the small system disk.
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal
   amp: true
   amp_dtype: bfloat16
   cudnn_benchmark: true
-  val_every_iters: 2000
+  # Per-iteration train metrics go to TensorBoard; validation selects weights.
+  val_every_iters: 100
+  best_window_iters: 100
+  selection_metric: psnr
   save_every_iters: 5000
   early_stop_patience_iters: 15000
   resume: null
+  tensorboard:
+    log_dir: /root/tf-logs
+    log_storage_dir: /root/autodl-tmp/tf-logs
+    symlink_log_dir: true
+    run_name: v1_minimal

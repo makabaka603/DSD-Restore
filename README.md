@@ -48,8 +48,9 @@ The default settings are stored in `configs/train_v1_minimal.yaml`:
 | Optimizer | AdamW | Learning rate `2e-4`, weight decay `1e-4` |
 | Scheduler | Cosine decay | Minimum learning rate `1e-6` |
 | Mixed precision | BF16 AMP | Automatically falls back to FP16 if BF16 is unavailable |
-| Validation | Every 2,000 iterations | Tracks PSNR and SSIM |
-| Checkpoint | Every 5,000 iterations | Writes `latest.pt` and a numbered checkpoint |
+| Training metrics | Every iteration | PSNR, SSIM, LPIPS, DISTS in TensorBoard |
+| Validation | Every 100 iterations | Selects weights on a fixed validation set |
+| Checkpoint | Every 100 iterations | Best validated state in each 100-iteration window |
 | Early stopping | 15,000 iterations | Stops if validation PSNR does not improve |
 
 The model contains about 8.79 million parameters. Batch size 16 is a safe starting point, not a guaranteed maximum: image dimensions, decoder activations, driver versions, and other GPU processes affect memory usage. Increase the batch size only after observing a stable run. Keep the learning rate at `2e-4` initially even if the batch size is changed.
@@ -112,19 +113,31 @@ Start a new training run:
 python train.py --config configs/train_v1_minimal.yaml
 ```
 
-Validation reports PSNR and SSIM per degradation task. The unweighted macro PSNR
-is used for selecting `best.pt`, so no large validation source dominates it.
+Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. The unweighted macro PSNR
+is used for selecting `best.pth`, so no large validation source dominates it.
 
-Checkpoints are written to `experiments/v1_minimal/checkpoints/`:
+TensorBoard event files are opened through `/root/tf-logs`, which the trainer
+creates as a symbolic link to `/root/autodl-tmp/tf-logs`. The files therefore
+occupy data-disk space while the required log path remains unchanged. LPIPS and
+DISTS backbone weights are similarly cached under `/root/autodl-tmp/torch-cache`.
+Start the UI with:
 
-- `best.pt`: highest validation PSNR
-- `latest.pt`: latest resumable state
-- `iter_XXXXXXX.pt`: periodic snapshots
+```bash
+tensorboard --logdir /root/tf-logs --port 6006 --bind_all
+```
+
+Checkpoints are written to the data disk at
+`/root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/`:
+
+- `best.pth`: highest validation PSNR over the complete run (compact model weights)
+- `latest.pth`: latest resumable state
+- `window_XXXXXXX_XXXXXXX_best.pth`: compact best weights in each 100-iteration window
+- `iter_XXXXXXX.pth`: periodic snapshots
 
 Resume a stopped run while preserving the optimizer, scheduler, AMP scaler, iteration, and best metric:
 
 ```powershell
-python train.py --config configs/train_v1_minimal.yaml --resume experiments/v1_minimal/checkpoints/latest.pt
+python train.py --config configs/train_v1_minimal.yaml --resume /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/latest.pth
 ```
 
 The configured `max_iters` is the total target. For example, resuming at iteration 50,000 with `max_iters: 75000` performs the remaining 25,000 iterations.
@@ -132,11 +145,11 @@ The configured `max_iters` is the total target. For example, resuming at iterati
 ## Test
 
 ```powershell
-python test.py --config configs/train_v1_minimal.yaml --checkpoint experiments/v1_minimal/checkpoints/best.pt
+python test.py --config configs/train_v1_minimal.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth
 ```
 
 ## Inference
 
 ```powershell
-python infer_real.py --checkpoint experiments/v1_minimal/checkpoints/best.pt --input data/real --output results/real_v1
+python infer_real.py --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth --input data/real --output results/real_v1
 ```
