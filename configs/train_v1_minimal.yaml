@@ -65,44 +65,44 @@ data:
       input_dir: datasets/Snow100K/val/input
       gt_dir: datasets/Snow100K/val/gt
       task: snow
-      max_samples: 100
+      max_samples: 10
     - name: rain13k_val
       input_dir: datasets/Rain13K/test/Test100/input
       gt_dir: datasets/Rain13K/test/Test100/target
       task: rain
-      max_samples: 100
+      max_samples: 10
     - name: reside6k_val
       input_dir: datasets/RESIDE-6K/test/hazy
       gt_dir: datasets/RESIDE-6K/test/GT
       task: haze
-      max_samples: 100
+      max_samples: 10
     - name: lolv2_real_val
       input_dir: datasets/LOLv2_real/Test/Input
       gt_dir: datasets/LOLv2_real/Test/GT
       task: lowlight
-      max_samples: 100
+      max_samples: 10
     - name: lolv2_synthetic_val
       input_dir: datasets/LOLv2_synthetic/Test/Input
       gt_dir: datasets/LOLv2_synthetic/Test/GT
       # The official test inputs have an extra leading "r" absent from GT names.
       gt_strip_input_prefix: r
       task: lowlight
-      max_samples: 100
+      max_samples: 10
     - name: div2k_dust_val
       clean_dir: datasets/DIV2K_valid_HR
       synthetic: dust
       task: dust
-      max_samples: 100
+      max_samples: 10
     - name: div2k_sand_val
       clean_dir: datasets/DIV2K_valid_HR
       synthetic: sand
       task: sand
-      max_samples: 100
+      max_samples: 10
     - name: div2k_colorcast_val
       clean_dir: datasets/DIV2K_valid_HR
       synthetic: colorcast
       task: colorcast
-      max_samples: 100
+      max_samples: 10
 
   # RTX 5090 (32 GB) baseline. Reduce to 8 if the real data pipeline runs OOM.
   batch_size: 16
@@ -138,6 +138,10 @@ runtime:
   val_every_iters: 100
   best_window_iters: 100
   selection_metric: psnr
+  train_metrics:
+    psnr_ssim_every_iters: 1
+    perceptual_every_iters: 100
+    perceptual_batch_samples: 4
   save_every_iters: 5000
   early_stop_patience_iters: 15000
   resume: null

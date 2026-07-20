@@ -48,7 +48,7 @@ The default settings are stored in `configs/train_v1_minimal.yaml`:
 | Optimizer | AdamW | Learning rate `2e-4`, weight decay `1e-4` |
 | Scheduler | Cosine decay | Minimum learning rate `1e-6` |
 | Mixed precision | BF16 AMP | Automatically falls back to FP16 if BF16 is unavailable |
-| Training metrics | Every iteration | PSNR, SSIM, LPIPS, DISTS in TensorBoard |
+| Training metrics | PSNR/SSIM every iteration | LPIPS/DISTS every 100 iterations on 4 samples |
 | Validation | Every 100 iterations | Selects weights on a fixed validation set |
 | Checkpoint | Every 100 iterations | Best validated state in each 100-iteration window |
 | Early stopping | 15,000 iterations | Stops if validation PSNR does not improve |
@@ -115,6 +115,8 @@ python train.py --config configs/train_v1_minimal.yaml
 
 Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. The unweighted macro PSNR
 is used for selecting `best.pth`, so no large validation source dominates it.
+Frequent validation uses at most 10 images per configured source. `test.py`
+removes this cap by default and evaluates every available test image.
 
 TensorBoard event files are opened through `/root/tf-logs`, which the trainer
 creates as a symbolic link to `/root/autodl-tmp/tf-logs`. The files therefore

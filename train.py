@@ -334,9 +334,13 @@ def train(cfg: dict, resume: str | None = None) -> None:
     val_every = cfg["runtime"].get("val_every_iters", 2000)
     save_every = cfg["runtime"].get("save_every_iters", 5000)
     window_every = cfg["runtime"].get("best_window_iters", 100)
+    train_metrics_cfg = cfg["runtime"].get("train_metrics", {})
+    psnr_ssim_every = train_metrics_cfg.get("psnr_ssim_every_iters", 1)
+    perceptual_every = train_metrics_cfg.get("perceptual_every_iters", 100)
+    perceptual_samples = train_metrics_cfg.get("perceptual_batch_samples", 4)
     early_stop_patience = cfg["runtime"].get("early_stop_patience_iters", 0)
-    if val_every <= 0 or save_every <= 0 or window_every <= 0:
-        raise ValueError("validation, save, and best-window intervals must be greater than zero.")
+    if min(val_every, save_every, window_every, psnr_ssim_every, perceptual_every, perceptual_samples) <= 0:
+        raise ValueError("validation, save, metric, sample, and best-window values must be greater than zero.")
     if val_every > window_every or window_every % val_every != 0:
         raise ValueError(
             "best_window_iters must be an exact multiple of val_every_iters so every "
@@ -365,15 +369,22 @@ def train(cfg: dict, resume: str | None = None) -> None:
             scheduler.step()
             global_step += 1
             restored = outputs["restored"].detach()
-            train_metrics = {
-                "psnr": batch_psnr(restored, batch["gt"]),
-                "ssim": batch_ssim(restored, batch["gt"]),
-                **perceptual(restored, batch["gt"]),
-            }
-            write_metrics(writer, "train/current", train_metrics, global_step)
             writer.add_scalar("train/loss", float(losses["total"].detach()), global_step)
             writer.add_scalar("train/learning_rate", optim.param_groups[0]["lr"], global_step)
+
+            train_metrics = {}
+            if global_step % psnr_ssim_every == 0:
+                train_metrics.update(
+                    psnr=batch_psnr(restored, batch["gt"]),
+                    ssim=batch_ssim(restored, batch["gt"]),
+                )
+            if global_step % perceptual_every == 0:
+                sample_count = min(perceptual_samples, restored.shape[0])
+                train_metrics.update(
+                    perceptual(restored[:sample_count], batch["gt"][:sample_count])
+                )
             for name, value in train_metrics.items():
+                writer.add_scalar(f"train/current/{name}", value, global_step)
                 if is_better(value, running_best[name], name):
                     running_best[name] = value
                 writer.add_scalar(f"train/best/{name}", running_best[name], global_step)

@@ -17,6 +17,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/train_v1_minimal.yaml")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument(
+        "--max-samples-per-source",
+        type=int,
+        default=0,
+        help="limit each test source; 0 evaluates every available sample",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -31,8 +37,14 @@ def main() -> None:
         cfg["runtime"].get("amp_dtype", "bfloat16"),
     )
     if cfg["data"].get("val_sources"):
+        test_sources = [dict(source) for source in cfg["data"]["val_sources"]]
+        for source in test_sources:
+            if args.max_samples_per_source > 0:
+                source["max_samples"] = args.max_samples_per_source
+            else:
+                source.pop("max_samples", None)
         dataset, _ = build_source_dataset(
-            cfg["data"]["val_sources"],
+            test_sources,
             crop_size=None,
             training=False,
             seed=cfg["experiment"].get("seed", 42),
