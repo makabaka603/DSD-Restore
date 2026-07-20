@@ -1,9 +1,10 @@
 import argparse
+import math
 from pathlib import Path
 
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -12,7 +13,14 @@ from losses import DSDRestoreV1Loss
 from metrics import batch_psnr, batch_ssim
 from models import DSDRestoreV1
 from utils.config import load_config
-from utils.runtime import ensure_dir, get_device, move_batch_to_device, seed_everything
+from utils.runtime import (
+    configure_cuda,
+    ensure_dir,
+    get_amp_settings,
+    get_device,
+    move_batch_to_device,
+    seed_everything,
+)
 
 
 def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
@@ -31,79 +39,223 @@ def build_loaders(cfg: dict) -> tuple[DataLoader, DataLoader]:
         crop_size=None,
         training=False,
     )
+    num_workers = data.get("num_workers", 0)
+    loader_kwargs = {
+        "batch_size": data["batch_size"],
+        "shuffle": True,
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "persistent_workers": data.get("persistent_workers", True) and num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = data.get("prefetch_factor", 2)
     train_loader = DataLoader(
         train_set,
-        batch_size=data["batch_size"],
-        shuffle=True,
-        num_workers=data.get("num_workers", 0),
-        pin_memory=True,
+        **loader_kwargs,
     )
-    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
     return train_loader, val_loader
 
 
 @torch.no_grad()
-def validate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> dict[str, float]:
+def validate(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+) -> dict[str, float]:
     model.eval()
     psnr_values, ssim_values = [], []
     for batch in loader:
         batch = move_batch_to_device(batch, device)
-        outputs = model(batch["input"])
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+            outputs = model(batch["input"])
         psnr_values.append(batch_psnr(outputs["restored"], batch["gt"]))
         ssim_values.append(batch_ssim(outputs["restored"], batch["gt"]))
     return {"psnr": sum(psnr_values) / len(psnr_values), "ssim": sum(ssim_values) / len(ssim_values)}
 
 
-def train(cfg: dict) -> None:
+def build_scheduler(optim: AdamW, max_iters: int, warmup_iters: int, min_lr: float) -> LambdaLR:
+    base_lr = optim.param_groups[0]["lr"]
+    min_ratio = min_lr / base_lr
+
+    def lr_multiplier(step: int) -> float:
+        if warmup_iters > 0 and step < warmup_iters:
+            return max(1, step + 1) / warmup_iters
+        progress = (step - warmup_iters) / max(1, max_iters - warmup_iters)
+        progress = min(max(progress, 0.0), 1.0)
+        return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return LambdaLR(optim, lr_lambda=lr_multiplier)
+
+
+def save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optim: AdamW,
+    scheduler: LambdaLR,
+    scaler: torch.amp.GradScaler,
+    cfg: dict,
+    global_step: int,
+    epoch: int,
+    best_psnr: float,
+    best_step: int,
+    metrics: dict[str, float],
+) -> None:
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optim.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "global_step": global_step,
+            "epoch": epoch,
+            "best_psnr": best_psnr,
+            "best_step": best_step,
+            "metrics": metrics,
+            "config": cfg,
+        },
+        path,
+    )
+
+
+def train(cfg: dict, resume: str | None = None) -> None:
     seed_everything(cfg["experiment"].get("seed", 42))
     device = get_device(cfg["runtime"].get("device", "auto"))
+    configure_cuda(device, cfg["runtime"].get("cudnn_benchmark", True))
+    amp_enabled, amp_dtype = get_amp_settings(
+        device,
+        cfg["runtime"].get("amp", False),
+        cfg["runtime"].get("amp_dtype", "bfloat16"),
+    )
     output_dir = ensure_dir(cfg["experiment"]["output_dir"])
     ckpt_dir = ensure_dir(output_dir / "checkpoints")
     train_loader, val_loader = build_loaders(cfg)
 
+    metadata_path = cfg["data"].get("train_metadata")
+    if cfg["loss"].get("lambda_cls", 0.0) > 0 and (
+        not metadata_path or not Path(metadata_path).exists()
+    ):
+        raise FileNotFoundError(
+            "lambda_cls is greater than zero, but train_metadata is missing. "
+            "Provide degradation labels or set loss.lambda_cls to 0.0."
+        )
+
     model = DSDRestoreV1(**cfg["model"]).to(device)
     criterion = DSDRestoreV1Loss(**cfg["loss"])
     optim = AdamW(model.parameters(), lr=cfg["optimization"]["lr"], weight_decay=cfg["optimization"]["weight_decay"])
-    scheduler = CosineAnnealingLR(
+    max_iters = cfg["optimization"]["max_iters"]
+    scheduler = build_scheduler(
         optim,
-        T_max=max(1, cfg["optimization"]["epochs"]),
-        eta_min=cfg["optimization"].get("min_lr", 1e-6),
+        max_iters=max_iters,
+        warmup_iters=cfg["optimization"].get("warmup_iters", 0),
+        min_lr=cfg["optimization"].get("min_lr", 1e-6),
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg["runtime"].get("amp", False) and device.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled and amp_dtype == torch.float16)
     best_psnr = -1.0
+    best_step = 0
+    global_step = 0
+    epoch = 0
+    last_metrics = {"psnr": float("nan"), "ssim": float("nan")}
 
-    for epoch in range(1, cfg["optimization"]["epochs"] + 1):
+    resume_path = resume or cfg["runtime"].get("resume")
+    if resume_path:
+        checkpoint = torch.load(resume_path, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optim.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        if checkpoint.get("scaler"):
+            scaler.load_state_dict(checkpoint["scaler"])
+        global_step = checkpoint.get("global_step", 0)
+        epoch = checkpoint.get("epoch", 0)
+        best_psnr = checkpoint.get("best_psnr", checkpoint.get("metrics", {}).get("psnr", -1.0))
+        best_step = checkpoint.get("best_step", global_step)
+        last_metrics = checkpoint.get("metrics", last_metrics)
+        print(f"Resumed from {resume_path} at iteration {global_step}.")
+
+    print(
+        f"device={device} amp={amp_enabled} amp_dtype={amp_dtype} "
+        f"batch_size={cfg['data']['batch_size']} max_iters={max_iters}"
+    )
+
+    val_every = cfg["runtime"].get("val_every_iters", 2000)
+    save_every = cfg["runtime"].get("save_every_iters", 5000)
+    early_stop_patience = cfg["runtime"].get("early_stop_patience_iters", 0)
+    if val_every <= 0 or save_every <= 0:
+        raise ValueError("val_every_iters and save_every_iters must be greater than zero.")
+    stop_training = False
+
+    while global_step < max_iters and not stop_training:
+        epoch += 1
         model.train()
-        running = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+        remaining = max_iters - global_step
+        pbar = tqdm(train_loader, total=min(len(train_loader), remaining), desc=f"Epoch {epoch}")
         for batch in pbar:
+            if global_step >= max_iters:
+                break
             batch = move_batch_to_device(batch, device)
             optim.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
+            with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
                 outputs = model(batch["input"])
                 losses = criterion(outputs, batch)
             scaler.scale(losses["total"]).backward()
             scaler.step(optim)
             scaler.update()
-            running += float(losses["total"].detach().item())
-            pbar.set_postfix(loss=f"{running / max(1, pbar.n):.4f}")
-        scheduler.step()
+            scheduler.step()
+            global_step += 1
+            pbar.set_postfix(
+                iteration=global_step,
+                loss=f"{float(losses['total'].detach()):.4f}",
+                lr=f"{optim.param_groups[0]['lr']:.2e}",
+            )
 
-        metrics = validate(model, val_loader, device)
-        print(f"epoch={epoch} psnr={metrics['psnr']:.3f} ssim={metrics['ssim']:.4f}")
-        state = {"model": model.state_dict(), "epoch": epoch, "metrics": metrics, "config": cfg}
-        if metrics["psnr"] > best_psnr:
-            best_psnr = metrics["psnr"]
-            torch.save(state, ckpt_dir / "best.pt")
-        if epoch % cfg["runtime"].get("save_every", 10) == 0:
-            torch.save(state, ckpt_dir / f"epoch_{epoch:04d}.pt")
+            should_validate = global_step % val_every == 0 or global_step == max_iters
+            if should_validate:
+                last_metrics = validate(model, val_loader, device, amp_enabled, amp_dtype)
+                print(
+                    f"iteration={global_step} psnr={last_metrics['psnr']:.3f} "
+                    f"ssim={last_metrics['ssim']:.4f}"
+                )
+                if last_metrics["psnr"] > best_psnr:
+                    best_psnr = last_metrics["psnr"]
+                    best_step = global_step
+                    save_checkpoint(
+                        ckpt_dir / "best.pt", model, optim, scheduler, scaler, cfg,
+                        global_step, epoch, best_psnr, best_step, last_metrics,
+                    )
+                elif early_stop_patience > 0 and global_step - best_step >= early_stop_patience:
+                    print(
+                        f"Early stopping at iteration {global_step}: validation PSNR has not "
+                        f"improved for {global_step - best_step} iterations."
+                    )
+                    stop_training = True
+                model.train()
+
+            if global_step % save_every == 0 or global_step == max_iters:
+                save_checkpoint(
+                    ckpt_dir / "latest.pt", model, optim, scheduler, scaler, cfg,
+                    global_step, epoch, best_psnr, best_step, last_metrics,
+                )
+                save_checkpoint(
+                    ckpt_dir / f"iter_{global_step:07d}.pt", model, optim, scheduler, scaler, cfg,
+                    global_step, epoch, best_psnr, best_step, last_metrics,
+                )
+
+            if stop_training:
+                save_checkpoint(
+                    ckpt_dir / "latest.pt", model, optim, scheduler, scaler, cfg,
+                    global_step, epoch, best_psnr, best_step, last_metrics,
+                )
+                break
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/train_v1_minimal.yaml")
+    parser.add_argument("--resume", default=None, help="checkpoint path used to resume training")
     args = parser.parse_args()
-    train(load_config(args.config))
+    train(load_config(args.config), resume=args.resume)
 
 
 if __name__ == "__main__":

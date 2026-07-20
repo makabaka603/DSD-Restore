@@ -19,15 +19,19 @@ data:
   val_gt_dir: data/mixed/val/gt
   val_metadata: data/mixed/val/metadata.json
   crop_size: 256
-  batch_size: 4
-  num_workers: 0
+  # RTX 5090 (32 GB) baseline. Reduce to 8 if the real data pipeline runs OOM.
+  batch_size: 16
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
 
 optimization:
-  epochs: 100
+  # Iteration-based training is independent of the number of training images.
+  max_iters: 75000
   lr: 0.0002
   weight_decay: 0.0001
   min_lr: 0.000001
-  warmup_epochs: 3
+  warmup_iters: 3000
 
 loss:
   lambda_rec: 1.0
@@ -38,5 +42,10 @@ loss:
 
 runtime:
   device: auto
-  amp: false
-  save_every: 10
+  amp: true
+  amp_dtype: bfloat16
+  cudnn_benchmark: true
+  val_every_iters: 2000
+  save_every_iters: 5000
+  early_stop_patience_iters: 15000
+  resume: null

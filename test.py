@@ -7,7 +7,7 @@ from datasets import PairedRestorationDataset
 from metrics import batch_psnr, batch_ssim
 from models import DSDRestoreV1
 from utils.config import load_config
-from utils.runtime import get_device, move_batch_to_device
+from utils.runtime import configure_cuda, get_amp_settings, get_device, move_batch_to_device
 
 
 @torch.no_grad()
@@ -19,6 +19,12 @@ def main() -> None:
 
     cfg = load_config(args.config)
     device = get_device(cfg["runtime"].get("device", "auto"))
+    configure_cuda(device, cfg["runtime"].get("cudnn_benchmark", True))
+    amp_enabled, amp_dtype = get_amp_settings(
+        device,
+        cfg["runtime"].get("amp", False),
+        cfg["runtime"].get("amp_dtype", "bfloat16"),
+    )
     dataset = PairedRestorationDataset(
         cfg["data"]["val_input_dir"],
         cfg["data"]["val_gt_dir"],
@@ -33,7 +39,8 @@ def main() -> None:
     psnr_values, ssim_values = [], []
     for batch in loader:
         batch = move_batch_to_device(batch, device)
-        outputs = model(batch["input"])
+        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
+            outputs = model(batch["input"])
         psnr_values.append(batch_psnr(outputs["restored"], batch["gt"]))
         ssim_values.append(batch_ssim(outputs["restored"], batch["gt"]))
     print(f"PSNR: {sum(psnr_values) / len(psnr_values):.3f}")
