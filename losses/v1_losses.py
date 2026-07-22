@@ -90,6 +90,26 @@ class DSDRestoreV1Loss(nn.Module):
         self.lambda_proto = lambda_proto
         self.lambda_sparse = lambda_sparse
 
+    @property
+    def component_weights(self) -> dict[str, float]:
+        return {
+            "rec": self.lambda_rec,
+            "ssim": self.lambda_ssim,
+            "freq": self.lambda_freq,
+            "color": self.lambda_color,
+            "cls": self.lambda_cls,
+            "proto": self.lambda_proto,
+            "sparse": self.lambda_sparse,
+        }
+
+    def weighted_components(
+        self, losses: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            name: losses[name] * weight
+            for name, weight in self.component_weights.items()
+        }
+
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         pred = outputs["restored"]
         target = batch["gt"]

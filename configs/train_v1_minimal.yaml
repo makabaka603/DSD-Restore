@@ -160,6 +160,14 @@ runtime:
     psnr_ssim_every_iters: 1
     perceptual_every_iters: 100
     perceptual_batch_samples: 4
+  # Paper-oriented diagnostics. Scalars are cheap; histograms and fixed image
+  # panels are intentionally sparse so TensorBoard does not throttle the RTX 5090.
+  diagnostics:
+    scalar_every_iters: 20
+    histogram_every_iters: 500
+    image_every_iters: 1000
+    image_samples: 8
+    save_image_panels: true
   save_every_iters: 5000
   early_stop_patience_iters: 15000
   resume: null

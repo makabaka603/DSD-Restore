@@ -227,6 +227,19 @@ points are buffered and synchronized every 20 iterations to avoid a CPU/GPU
 barrier after every optimizer step. The `timing/*` TensorBoard series report
 data wait, GPU training, metric, validation, checkpoint, and throughput timing.
 
+TensorBoard also records paper-oriented diagnostics without changing model
+inference. Raw and weighted reconstruction/SSIM/frequency/color/classification/
+prototype/sparse-mask losses are written every iteration. Every 20 iterations,
+the trainer records prototype entropy and cosine collapse indicators, prototype
+usage, fusion routing by degradation task, dense/sparse feature norms and
+high-frequency energy, sparse-mask coverage/TV, tokenizer precision/recall/F1,
+gradient norm, AMP scale, and GPU memory. Prototype-weight histograms are written
+every 500 iterations. Every 1,000 iterations, validation writes a fixed panel
+whose columns are input, restored, GT, absolute error, sparse mask, and mask
+overlay. The same panel and a row-label text file are saved under the current
+stage's `experiments/<stage>/visualizations/` directory for paper preparation.
+These intervals can be changed under `runtime.diagnostics`.
+
 Create and run a representative 200-iteration benchmark before a formal run:
 
 ```bash

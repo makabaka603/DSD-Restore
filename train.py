@@ -7,15 +7,22 @@ from pathlib import Path
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, default_collate
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 from datasets import PairedRestorationDataset, build_balanced_sampler, build_source_dataset
 from losses import DSDRestoreV1Loss
 from metrics import (
+    DENSE_NAMES,
+    SPARSE_NAMES,
+    MultilabelAccumulator,
     PerceptualMetrics,
     batch_psnr_tensor,
     batch_ssim_tensor,
+    gradient_global_norm,
+    model_diagnostics,
+    restoration_panel,
 )
 from models import DSDRestoreV1
 from utils.config import load_config
@@ -135,6 +142,68 @@ def use_channels_last(batch: dict, enabled: bool) -> dict:
 
 
 @torch.no_grad()
+def collect_fixed_visuals(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    channels_last: bool,
+    max_samples: int,
+) -> tuple[torch.Tensor | None, list[str]]:
+    """Select deterministic, task-diverse samples across the full validation set."""
+    dataset = loader.dataset
+    if max_samples <= 0 or len(dataset) == 0:
+        return None, []
+    candidate_count = min(len(dataset), max(64, max_samples * 8))
+    if candidate_count == 1:
+        candidate_indices = [0]
+    else:
+        candidate_indices = [
+            round(index * (len(dataset) - 1) / (candidate_count - 1))
+            for index in range(candidate_count)
+        ]
+    rows: list[torch.Tensor] = []
+    labels: list[str] = []
+    seen_tasks: set[str] = set()
+    fallback: list[tuple[dict, str]] = []
+    for index in candidate_indices:
+        sample = dataset[index]
+        task = str(sample.get("task", "mixed"))
+        if task in seen_tasks:
+            if len(fallback) < max_samples:
+                fallback.append((sample, task))
+            continue
+        visual_batch = default_collate([sample])
+        visual_batch = use_channels_last(
+            move_batch_to_device(visual_batch, device), channels_last
+        )
+        with torch.amp.autocast(
+            device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
+        ):
+            visual_outputs = model(visual_batch["input"])
+        rows.append(restoration_panel(visual_batch, visual_outputs, max_samples=1))
+        labels.append(task)
+        seen_tasks.add(task)
+        if len(rows) == max_samples:
+            break
+    for sample, task in fallback:
+        if len(rows) == max_samples:
+            break
+        visual_batch = default_collate([sample])
+        visual_batch = use_channels_last(
+            move_batch_to_device(visual_batch, device), channels_last
+        )
+        with torch.amp.autocast(
+            device_type=device.type, enabled=amp_enabled, dtype=amp_dtype
+        ):
+            visual_outputs = model(visual_batch["input"])
+        rows.append(restoration_panel(visual_batch, visual_outputs, max_samples=1))
+        labels.append(task)
+    return (torch.cat(rows, dim=1), labels) if rows else (None, [])
+
+
+@torch.no_grad()
 def validate(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -147,11 +216,16 @@ def validate(
     perceptual_max_size: int | None = None,
     max_samples_per_source: int = 0,
     channels_last: bool = False,
-) -> dict[str, float | dict[str, dict[str, float]]]:
+    collect_diagnostics: bool = True,
+    visual_samples: int = 0,
+) -> dict:
     model.eval()
     task_values: dict[str, dict[str, list[float]]] = {}
     perceptual_source_counts: dict[str, int] = {}
     source_counts: dict[str, int] = {}
+    diagnostic_sums: dict[str, float] = {}
+    diagnostic_counts: dict[str, int] = {}
+    tokenizer_stats = MultilabelAccumulator()
     for batch in loader:
         task = batch.get("task", ["mixed"])[0]
         source = batch.get("source", [task])[0]
@@ -162,6 +236,13 @@ def validate(
         batch = use_channels_last(move_batch_to_device(batch, device), channels_last)
         with torch.amp.autocast(device_type=device.type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(batch["input"])
+        if collect_diagnostics:
+            diagnostics = model_diagnostics(outputs, batch, include_tokenizer=False)
+            tokenizer_stats.update(outputs, batch)
+            for name, raw_value in diagnostics.items():
+                value = float(raw_value.item())
+                diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value
+                diagnostic_counts[name] = diagnostic_counts.get(name, 0) + 1
         values = task_values.setdefault(task, {"psnr": [], "ssim": [], "lpips": [], "dists": []})
         values["psnr"].append(batch_psnr_tensor(outputs["restored"], batch["gt"]))
         values["ssim"].append(batch_ssim_tensor(outputs["restored"], batch["gt"]))
@@ -202,6 +283,28 @@ def validate(
     if perceptual_tasks:
         result["lpips"] = sum(values["lpips"] for values in perceptual_tasks) / len(perceptual_tasks)
         result["dists"] = sum(values["dists"] for values in perceptual_tasks) / len(perceptual_tasks)
+    if collect_diagnostics:
+        diagnostics = {
+            name: diagnostic_sums[name] / diagnostic_counts[name]
+            for name in diagnostic_sums
+        }
+        diagnostics.update(
+            {name: float(value.item()) for name, value in tokenizer_stats.compute().items()}
+        )
+        result["diagnostics"] = diagnostics
+    if visual_samples > 0:
+        visual_panel, visual_labels = collect_fixed_visuals(
+            model,
+            loader,
+            device,
+            amp_enabled,
+            amp_dtype,
+            channels_last,
+            visual_samples,
+        )
+        if visual_panel is not None:
+            result["visual_panel"] = visual_panel
+            result["visual_labels"] = visual_labels
     return result
 
 
@@ -238,6 +341,21 @@ def write_metrics(writer: object, prefix: str, metrics: dict, step: int) -> None
             writer.add_scalar(f"{prefix}/{name}", metrics[name], step)
 
 
+def write_scalar_dict(writer: object, prefix: str, values: dict, step: int) -> None:
+    for name, raw_value in values.items():
+        value = float(raw_value.item()) if torch.is_tensor(raw_value) else float(raw_value)
+        writer.add_scalar(f"{prefix}/{name}", value, step)
+
+
+def write_prototype_histograms(writer: object, outputs: dict, step: int) -> None:
+    dense_weights = outputs["dense_prototype_weights"].detach().float().cpu()
+    sparse_weights = outputs["sparse_prototype_weights"].detach().float().cpu()
+    for index, name in enumerate(DENSE_NAMES):
+        writer.add_histogram(f"prototype_hist/dense/{name}", dense_weights[:, index], step)
+    for index, name in enumerate(SPARSE_NAMES):
+        writer.add_histogram(f"prototype_hist/sparse/{name}", sparse_weights[:, index], step)
+
+
 def flush_train_logs(
     records: list[dict],
     writer: object,
@@ -261,6 +379,10 @@ def flush_train_logs(
         latest["loss"] = loss
         writer.add_scalar("train/loss", loss, step)
         writer.add_scalar("train/learning_rate", record["lr"], step)
+        write_scalar_dict(writer, "train/loss_components", record["losses"], step)
+        write_scalar_dict(writer, "train/loss_weighted", record["weighted_losses"], step)
+        if record.get("diagnostics"):
+            write_scalar_dict(writer, "train_diagnostics", record["diagnostics"], step)
         for name, raw_value in record["metrics"].items():
             value = float(raw_value.item()) if torch.is_tensor(raw_value) else float(raw_value)
             latest[name] = value
@@ -279,6 +401,7 @@ def flush_train_logs(
         last_step,
     )
     writer.add_scalar("timing/interval_wall_s", elapsed, last_step)
+    writer.add_scalar("timing/iteration_wall_ms", 1000.0 * elapsed / len(records), last_step)
     writer.add_scalar(
         "timing/train_images_per_s", len(records) * batch_size / elapsed, last_step
     )
@@ -536,13 +659,23 @@ def train(
     selection_val_samples = cfg["runtime"].get("selection_val_max_samples_per_source", 10)
     log_every = cfg["runtime"].get("log_every_iters", 20)
     early_stop_patience = cfg["runtime"].get("early_stop_patience_iters", 0)
+    diagnostics_cfg = cfg["runtime"].get("diagnostics", {})
+    diagnostics_every = diagnostics_cfg.get("scalar_every_iters", 20)
+    histogram_every = diagnostics_cfg.get("histogram_every_iters", 500)
+    image_every = diagnostics_cfg.get("image_every_iters", 1000)
+    image_samples = diagnostics_cfg.get("image_samples", 8)
+    save_image_panels = diagnostics_cfg.get("save_image_panels", True)
     if min(
         val_every, save_every, window_every, psnr_ssim_every, perceptual_every,
         perceptual_samples, val_perceptual_every, val_perceptual_samples,
         val_perceptual_max_size, selection_val_every, probe_val_samples,
-        selection_val_samples, log_every,
+        selection_val_samples, log_every, diagnostics_every, histogram_every,
+        image_every, image_samples,
     ) <= 0:
-        raise ValueError("validation, save, metric, sample, and best-window values must be greater than zero.")
+        raise ValueError(
+            "validation, save, metric, diagnostic, sample, and best-window values "
+            "must be greater than zero."
+        )
     if val_every > window_every or window_every % val_every != 0:
         raise ValueError(
             "best_window_iters must be an exact multiple of val_every_iters so every "
@@ -562,6 +695,8 @@ def train(
     log_interval_started = time.perf_counter()
     loader_ready_at = time.perf_counter()
     compiled_step_verified = active_model is model
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     while global_step < max_iters and not stop_training:
         epoch += 1
@@ -573,6 +708,8 @@ def train(
             data_wait_s = batch_received_at - loader_ready_at
             if global_step >= max_iters:
                 break
+            next_step = global_step + 1
+            diagnostic_step = next_step % diagnostics_every == 0
             batch = use_channels_last(move_batch_to_device(batch, device), channels_last_enabled)
             train_start = train_end = metric_end = None
             if device.type == "cuda":
@@ -599,6 +736,27 @@ def train(
                     losses = criterion(outputs, batch)
                 scaler.scale(losses["total"]).backward()
                 compiled_step_verified = True
+            diagnostics = {}
+            if diagnostic_step:
+                if scaler.is_enabled():
+                    scaler.unscale_(optim)
+                with torch.no_grad():
+                    diagnostics = model_diagnostics(outputs, batch)
+                    diagnostics["system/gradient_global_norm"] = gradient_global_norm(model)
+                    diagnostics["system/amp_scale"] = torch.tensor(
+                        float(scaler.get_scale()), device=device
+                    )
+                    if device.type == "cuda":
+                        gib = float(1024 ** 3)
+                        diagnostics["system/gpu_memory_allocated_gb"] = torch.tensor(
+                            torch.cuda.memory_allocated(device) / gib, device=device
+                        )
+                        diagnostics["system/gpu_memory_reserved_gb"] = torch.tensor(
+                            torch.cuda.memory_reserved(device) / gib, device=device
+                        )
+                        diagnostics["system/gpu_memory_peak_gb"] = torch.tensor(
+                            torch.cuda.max_memory_allocated(device) / gib, device=device
+                        )
             scaler.step(optim)
             scaler.update()
             scheduler.step()
@@ -606,6 +764,10 @@ def train(
                 train_end.record()
             global_step += 1
             restored = outputs["restored"].detach()
+            if global_step % histogram_every == 0:
+                write_prototype_histograms(writer, outputs, global_step)
+            if diagnostic_step and device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
 
             train_metrics = {}
             if global_step % psnr_ssim_every == 0:
@@ -624,6 +786,16 @@ def train(
                 {
                     "step": global_step,
                     "loss": losses["total"].detach(),
+                    "losses": {
+                        name: value.detach()
+                        for name, value in losses.items()
+                        if name != "total"
+                    },
+                    "weighted_losses": {
+                        name: value.detach()
+                        for name, value in criterion.weighted_components(losses).items()
+                    },
+                    "diagnostics": diagnostics,
                     "lr": optim.param_groups[0]["lr"],
                     "metrics": train_metrics,
                     "data_wait_s": data_wait_s,
@@ -662,6 +834,12 @@ def train(
                     perceptual_max_size=val_perceptual_max_size,
                     max_samples_per_source=val_sample_limit,
                     channels_last=channels_last_enabled,
+                    collect_diagnostics=True,
+                    visual_samples=(
+                        image_samples
+                        if global_step % image_every == 0 or global_step == max_iters
+                        else 0
+                    ),
                 )
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -670,7 +848,34 @@ def train(
                 writer.add_scalar("validation/sample_limit_per_source", val_sample_limit, global_step)
                 val_prefix = "val" if selection_validation else "val_probe"
                 task_prefix = "val_by_task" if selection_validation else "val_probe_by_task"
+                validation_diagnostics = current_metrics.pop("diagnostics", {})
+                visual_panel = current_metrics.pop("visual_panel", None)
+                visual_labels = current_metrics.pop("visual_labels", [])
                 write_metrics(writer, val_prefix, current_metrics, global_step)
+                if validation_diagnostics:
+                    write_scalar_dict(
+                        writer,
+                        f"{val_prefix}_diagnostics",
+                        validation_diagnostics,
+                        global_step,
+                    )
+                if visual_panel is not None:
+                    writer.add_image("validation_images/fixed_panel", visual_panel, global_step)
+                    if save_image_panels:
+                        visualization_dir = ensure_dir(output_dir / "visualizations")
+                        panel_path = visualization_dir / f"step_{global_step:07d}_panel.png"
+                        TF.to_pil_image(visual_panel.clamp(0, 1)).save(panel_path)
+                        panel_path.with_suffix(".txt").write_text(
+                            "Columns: Input | Restored | GT | Absolute Error | Sparse Mask | "
+                            f"Mask Overlay\nRows: {' | '.join(visual_labels)}\n",
+                            encoding="utf-8",
+                        )
+                    writer.add_text(
+                        "validation_images/layout",
+                        "Columns: Input | Restored | GT | Absolute Error | Sparse Mask | "
+                        f"Mask Overlay. Rows: {' | '.join(visual_labels)}",
+                        global_step,
+                    )
                 for task, task_metrics in current_metrics.get("per_task", {}).items():
                     write_metrics(writer, f"{task_prefix}/{task}", task_metrics, global_step)
                 message = (
