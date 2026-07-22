@@ -58,16 +58,23 @@ def prototype_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tens
 
 def sparse_mask_loss(mask: torch.Tensor, sparse_label: torch.Tensor) -> torch.Tensor:
     """Encourage sparse, non-empty masks only when an occlusion label is present."""
-    has_sparse = sparse_label.amax(dim=1)
-    mask_flat = mask.flatten(1)
-    presence = mask_flat.amax(dim=1).clamp(1e-6, 1.0 - 1e-6)
-    presence_loss = F.binary_cross_entropy(presence, has_sparse)
-    mean_coverage = mask_flat.mean(dim=1)
-    coverage_loss = ((1.0 - has_sparse) * mean_coverage).mean()
-    coverage_loss = coverage_loss + 0.05 * (has_sparse * mean_coverage).mean()
-    tv_h = torch.abs(mask[:, :, 1:, :] - mask[:, :, :-1, :]).mean()
-    tv_w = torch.abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]).mean()
-    return presence_loss + coverage_loss + 0.1 * (tv_h + tv_w)
+    # CUDA autocast intentionally rejects probability-space BCE because its
+    # backward pass can overflow in float16/bfloat16. Keep this small regularizer
+    # in FP32 while the model and the remaining losses continue to use AMP.
+    # Casting before clamping is also important: 1 - 1e-6 rounds back to 1 in
+    # bfloat16, which would otherwise make BCE numerically unstable.
+    with torch.amp.autocast(device_type=mask.device.type, enabled=False):
+        mask_float = mask.float()
+        has_sparse = sparse_label.float().amax(dim=1)
+        mask_flat = mask_float.flatten(1)
+        presence = mask_flat.amax(dim=1).clamp(1e-6, 1.0 - 1e-6)
+        presence_loss = F.binary_cross_entropy(presence, has_sparse)
+        mean_coverage = mask_flat.mean(dim=1)
+        coverage_loss = ((1.0 - has_sparse) * mean_coverage).mean()
+        coverage_loss = coverage_loss + 0.05 * (has_sparse * mean_coverage).mean()
+        tv_h = torch.abs(mask_float[:, :, 1:, :] - mask_float[:, :, :-1, :]).mean()
+        tv_w = torch.abs(mask_float[:, :, :, 1:] - mask_float[:, :, :, :-1]).mean()
+        return presence_loss + coverage_loss + 0.1 * (tv_h + tv_w)
 
 
 class DSDRestoreV1Loss(nn.Module):

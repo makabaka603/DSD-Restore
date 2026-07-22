@@ -6,11 +6,34 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from losses import DSDRestoreV1Loss
+from losses.v1_losses import sparse_mask_loss
 from metrics import gradient_global_norm, model_diagnostics, restoration_panel
 from models import DSDRestoreV1
 
 
+def check_sparse_mask_amp() -> None:
+    """Regression test for probability-space BCE under automatic mixed precision."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_dtype = (
+        torch.bfloat16
+        if device.type == "cpu" or torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+    logits = torch.randn(2, 1, 16, 16, device=device, requires_grad=True)
+    sparse_label = torch.tensor(
+        [[1, 0, 0, 0], [0, 0, 0, 0]], dtype=torch.float32, device=device
+    )
+    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype):
+        loss = sparse_mask_loss(logits.sigmoid(), sparse_label)
+    loss.backward()
+    if loss.dtype != torch.float32:
+        raise RuntimeError(f"Sparse-mask AMP loss must be FP32, got {loss.dtype}")
+    if not torch.isfinite(loss) or logits.grad is None or not torch.isfinite(logits.grad).all():
+        raise RuntimeError("Sparse-mask AMP loss or gradients are not finite")
+
+
 def main() -> None:
+    check_sparse_mask_amp()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
     batch = {
         "input": torch.rand(2, 3, 64, 64),
@@ -50,6 +73,7 @@ def main() -> None:
     if panel.shape != (3, 128, 384):
         raise ValueError(f"Unexpected TensorBoard panel shape: {tuple(panel.shape)}")
     print("DSD-Restore V1 smoke test passed")
+    print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")
     print(f"dense_tokens: {tuple(outputs['dense_tokens'].shape)}")
     print(f"sparse_tokens: {tuple(outputs['sparse_tokens'].shape)}")
