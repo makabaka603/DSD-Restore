@@ -51,38 +51,15 @@ data:
       gt_dir: datasets/LOLv2_synthetic/Train/GT
       task: lowlight
       probability: 0.05
-    - name: div2k_dense_single
-      clean_dir: datasets/DIV2K_train_HR
-      mixtures:
-        - [dust]
-        - [sand]
-        - [colorcast]
-      probability: 0.10
-    - name: div2k_dense_dense
-      clean_dir: datasets/DIV2K_train_HR
-      mixtures:
-        - [dust, haze]
-        - [dust, lowlight]
-        - [sand, haze]
-        - [haze, lowlight]
-      probability: 0.25
-    - name: div2k_dense_sparse
-      clean_dir: datasets/DIV2K_train_HR
-      mixtures:
-        - [dust, rain]
-        - [haze, rain]
-        - [lowlight, rain]
-        - [haze, snow]
-        - [lowlight, snow]
-      probability: 0.20
-    - name: div2k_triple
-      clean_dir: datasets/DIV2K_train_HR
-      mixtures:
-        - [dust, haze, lowlight]
-        - [dust, lowlight, rain]
-        - [haze, lowlight, rain]
-        - [haze, lowlight, snow]
-      probability: 0.05
+    # Pre-generated lossless 256x256 pairs. Its internal file counts are
+    # 10:25:20:5, so a 60% source probability reproduces the four V1 synthetic
+    # category probabilities exactly without online CPU synthesis.
+    - name: synthetic_composite_train
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      probability: 0.60
 
   # Validation is capped per task and reported as a macro average, preventing
   # large datasets from dominating checkpoint selection.
@@ -114,46 +91,15 @@ data:
       gt_strip_input_prefix: r
       task: lowlight
       max_samples: 10
-    - name: div2k_dust_val
-      clean_dir: datasets/DIV2K_valid_HR
-      synthetic: dust
-      task: dust
-      max_samples: 10
-    - name: div2k_sand_val
-      clean_dir: datasets/DIV2K_valid_HR
-      synthetic: sand
-      task: sand
-      max_samples: 10
-    - name: div2k_colorcast_val
-      clean_dir: datasets/DIV2K_valid_HR
-      synthetic: colorcast
-      task: colorcast
-      max_samples: 10
-    - name: div2k_dense_dense_val
-      clean_dir: datasets/DIV2K_valid_HR
-      mixtures:
-        - [dust, haze]
-        - [dust, lowlight]
-        - [sand, haze]
-        - [haze, lowlight]
-      max_samples: 10
-    - name: div2k_dense_sparse_val
-      clean_dir: datasets/DIV2K_valid_HR
-      mixtures:
-        - [dust, rain]
-        - [haze, rain]
-        - [lowlight, rain]
-        - [haze, snow]
-        - [lowlight, snow]
-      max_samples: 10
-    - name: div2k_triple_val
-      clean_dir: datasets/DIV2K_valid_HR
-      mixtures:
-        - [dust, haze, lowlight]
-        - [dust, lowlight, rain]
-        - [haze, lowlight, rain]
-        - [haze, lowlight, snow]
-      max_samples: 10
+    # Generated from 40 clean DIV2K-train images held out before materializing
+    # SyntheticCompositeTrain. Metadata categories let validation cap and report
+    # each exact degradation combination independently.
+    - name: synthetic_composite_val
+      input_dir: datasets/SyntheticCompositeVal/input
+      gt_dir: datasets/SyntheticCompositeVal/gt
+      metadata_path: datasets/SyntheticCompositeVal/metadata.json
+      require_metadata: true
+      max_samples: 1200
 
   # RTX 5090 (32 GB) baseline. This is the physical and effective batch size;
   # gradient accumulation is intentionally 1. Reduce to 8 only after a real OOM.

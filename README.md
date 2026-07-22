@@ -86,6 +86,12 @@ datasets/
   LOLv2_synthetic/{Train,Test}/{Input,GT}/
   DIV2K_train_HR/
   DIV2K_valid_HR/
+  SyntheticCompositeTrain/{input,gt}/
+  SyntheticCompositeTrain/metadata.json
+  SyntheticCompositeVal/{input,gt}/
+  SyntheticCompositeVal/metadata.json
+  Synthetic-Mixed-Test-1K/{input,gt}/
+  Synthetic-Mixed-Test-1K/metadata.json
   Dusty Images Dataset/       # real inference only; never paired by folder order
 ```
 
@@ -99,17 +105,52 @@ Training probabilities are configured independently from dataset sizes:
 | Dense + sparse composition | 20% |
 | Three-degradation composition | 5% |
 
-DIV2K images are clean targets. Dense degradation inputs are generated online,
-with fixed seeds for validation. Composite synthesis always applies dense
-degradations before sparse rain/snow occlusions and returns continuous
-multi-label strengths. Dusty Images has no verified same-scene clean targets,
-so it is reserved for qualitative real-image inference.
+DIV2K images are clean sources used once to materialize the synthetic paired
+sets before training. Composite synthesis always applies dense degradations
+before sparse rain/snow occlusions and records continuous multi-label strengths
+in `metadata.json`. The generator reserves the last 40 sorted DIV2K-train
+images exclusively for `SyntheticCompositeVal`; they are never used to build
+`SyntheticCompositeTrain`. `DIV2K_valid_HR` remains independent and is used
+only for the final synthetic test benchmark. Dusty Images has no verified
+same-scene clean targets, so it remains qualitative real-image inference data.
+
+First preview the synthesis operators:
+
+```bash
+python scripts/preview_synthetic_degradations.py --output results/composite_preview.jpg --seed 42
+```
+
+Then materialize the default 60,000-pair training set and 1,200-pair validation
+set. Run this command from `/root/autodl-tmp/DSD-Restore`, so the defaults are
+created under `/root/autodl-tmp/DSD-Restore/datasets`:
+
+```bash
+python scripts/generate_composite_train.py \
+  --clean-dir datasets/DIV2K_train_HR \
+  --train-output datasets/SyntheticCompositeTrain \
+  --val-output datasets/SyntheticCompositeVal \
+  --train-samples 60000 \
+  --val-samples 1200 \
+  --size 256 \
+  --val-clean-count 40 \
+  --workers 8 \
+  --seed 20260722
+```
+
+The synthetic portion has fixed counts of 10,000 single-dense, 25,000
+dense+dense, 20,000 dense+sparse, and 5,000 triple-degradation samples. Combined
+with the configured real paired sources, this gives the V1 probabilities
+30%/20%/25%/20%/5%.
 
 Generate the fixed synthetic composite benchmark without overwriting an
 existing copy:
 
-```powershell
-python scripts/generate_mixed_test_1k.py --clean-dir datasets/DIV2K_valid_HR --output datasets/Synthetic-Mixed-Test-1K --size 512
+```bash
+python scripts/generate_mixed_test_1k.py \
+  --clean-dir datasets/DIV2K_valid_HR \
+  --output datasets/Synthetic-Mixed-Test-1K \
+  --size 512 \
+  --seed 20260722
 ```
 
 The output contains 1,000 paired images plus `metadata.json`, following the
@@ -118,19 +159,21 @@ once experiments begin.
 
 Evaluate a generated copy with per-combination metrics:
 
-```powershell
+```bash
 python test.py --config configs/train_v1_minimal.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth --test-input-dir datasets/Synthetic-Mixed-Test-1K/input --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json
 ```
 
 Before a formal run, audit paths, train/validation leakage, sampling ratios, and
 every paired image size:
 
-```powershell
+```bash
+python scripts/audit_offline_composite_data.py --check-sizes
 python scripts/audit_training_data.py --check-sizes
-python scripts/preview_synthetic_degradations.py
+python scripts/smoke_test_data_pipeline.py --num-workers 8
 ```
 
-Inspect `results/synthetic_preview.jpg` before training. A faster path-only audit
+The first audit verifies input/GT/metadata parity, label ranges, exact test-set
+counts, and clean-source separation across train/validation/test. A faster audit
 can omit `--check-sizes`.
 
 ## Train

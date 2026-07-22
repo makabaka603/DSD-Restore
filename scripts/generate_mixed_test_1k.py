@@ -115,8 +115,8 @@ def main() -> None:
             )
 
             filename = f"{global_index:04d}_{category}.png"
-            target_image.save(gt_dir / filename)
-            TF.to_pil_image(degraded).save(input_dir / filename)
+            target_image.save(gt_dir / filename, compress_level=3)
+            TF.to_pil_image(degraded).save(input_dir / filename, compress_level=3)
             metadata["samples"][filename] = {
                 "category": category,
                 "tasks": list(tasks),

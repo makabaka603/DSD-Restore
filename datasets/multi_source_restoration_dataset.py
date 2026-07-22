@@ -1,4 +1,5 @@
 import hashlib
+import json
 import random
 from pathlib import Path
 
@@ -262,6 +263,7 @@ class RestorationSourceDataset(Dataset):
         self.seed = seed
         self.synthetic = config.get("synthetic")
         self.clean_source = bool(self.synthetic or self.mixtures)
+        self.metadata: dict[str, dict] = {}
 
         if self.clean_source:
             clean_dir = Path(config["clean_dir"])
@@ -293,6 +295,27 @@ class RestorationSourceDataset(Dataset):
                 raise FileNotFoundError(
                     f"{self.name} has {len(missing)} inputs without same-name GT files. Examples:\n{preview}"
                 )
+            metadata_path = config.get("metadata_path")
+            if metadata_path:
+                metadata_file = Path(metadata_path)
+                if not metadata_file.exists():
+                    raise FileNotFoundError(
+                        f"Metadata file not found for {self.name}: {metadata_file}"
+                    )
+                metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                self.metadata = metadata.get("samples", metadata)
+            if config.get("require_metadata", False):
+                missing_metadata = [
+                    input_path.name
+                    for input_path, _ in self.pairs
+                    if input_path.name not in self.metadata
+                ]
+                if missing_metadata:
+                    preview = "\n".join(f"  {name}" for name in missing_metadata[:5])
+                    raise FileNotFoundError(
+                        f"{self.name} has {len(missing_metadata)} samples without metadata. "
+                        f"Examples:\n{preview}"
+                    )
 
         max_samples = config.get("max_samples")
         if max_samples and len(self.pairs) > max_samples:
@@ -321,7 +344,16 @@ class RestorationSourceDataset(Dataset):
         active_tasks = self.tasks
         dense_label = self.dense_label
         sparse_label = self.sparse_label
-        if self.clean_source:
+        metadata = self.metadata.get(input_path.name, {})
+        if metadata:
+            strengths = metadata.get("strengths", metadata)
+            dense_label, sparse_label = _strength_vector(strengths)
+            active_tasks = metadata.get("tasks") or [
+                key
+                for key in (*DENSE_KEYS, *SPARSE_KEYS)
+                if float(strengths.get(key, 0.0)) > 0
+            ]
+        elif self.clean_source:
             if self.training:
                 # DataLoader seeds each worker's global torch RNG. Drawing the
                 # per-sample seed from it keeps augmentation random and reproducible.
@@ -349,7 +381,7 @@ class RestorationSourceDataset(Dataset):
             "dense_label": dense_label.clone(),
             "sparse_label": sparse_label.clone(),
             "name": input_path.name,
-            "source": self.name,
+            "source": metadata.get("category", self.name),
             "task": "+".join(active_tasks),
         }
 
