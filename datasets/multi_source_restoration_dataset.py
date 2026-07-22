@@ -317,6 +317,46 @@ class RestorationSourceDataset(Dataset):
                         f"Examples:\n{preview}"
                     )
 
+            include_groups = {str(value) for value in config.get("include_groups", [])}
+            exclude_groups = {str(value) for value in config.get("exclude_groups", [])}
+            min_degradations = config.get("min_degradations")
+            max_degradations = config.get("max_degradations")
+            has_metadata_filter = bool(include_groups or exclude_groups) or any(
+                value is not None for value in (min_degradations, max_degradations)
+            )
+            if has_metadata_filter:
+                if not metadata_path:
+                    raise ValueError(
+                        f"{self.name} uses metadata filters but has no metadata_path"
+                    )
+                if min_degradations is not None and int(min_degradations) < 1:
+                    raise ValueError("min_degradations must be at least 1")
+                if max_degradations is not None and int(max_degradations) < 1:
+                    raise ValueError("max_degradations must be at least 1")
+                if (
+                    min_degradations is not None
+                    and max_degradations is not None
+                    and int(min_degradations) > int(max_degradations)
+                ):
+                    raise ValueError("min_degradations cannot exceed max_degradations")
+
+                filtered_pairs = []
+                for pair in self.pairs:
+                    record = self.metadata.get(pair[0].name, {})
+                    group = str(record.get("group", ""))
+                    tasks = record.get("tasks") or []
+                    task_count = len(tasks)
+                    if include_groups and group not in include_groups:
+                        continue
+                    if exclude_groups and group in exclude_groups:
+                        continue
+                    if min_degradations is not None and task_count < int(min_degradations):
+                        continue
+                    if max_degradations is not None and task_count > int(max_degradations):
+                        continue
+                    filtered_pairs.append(pair)
+                self.pairs = filtered_pairs
+
         max_samples = config.get("max_samples")
         if max_samples and len(self.pairs) > max_samples:
             if max_samples == 1:

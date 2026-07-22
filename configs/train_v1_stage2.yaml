@@ -1,0 +1,23 @@
+base_config: train_v1_minimal.yaml
+
+stage:
+  name: stage2
+  objective: joint_training
+  init_from_stage: stage1
+
+experiment:
+  name: v1_stage2_joint
+  output_dir: experiments/v1_stage2_joint
+
+optimization:
+  max_iters: 140000
+  lr: 0.0002
+  min_lr: 0.000001
+  warmup_iters: 5000
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage2_joint
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage1_single/best.pth
+  early_stop_patience_iters: 0
+  tensorboard:
+    run_name: v1_stage2_joint

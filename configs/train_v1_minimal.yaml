@@ -111,8 +111,9 @@ data:
   val_prefetch_factor: 2
 
 optimization:
-  # Iteration-based training is independent of the number of training images.
-  max_iters: 75000
+  # Common full-distribution settings used by Stage 2. Formal training should
+  # start with train_v1_stage1.yaml and proceed through all three stage configs.
+  max_iters: 140000
   lr: 0.0002
   weight_decay: 0.0001
   min_lr: 0.000001

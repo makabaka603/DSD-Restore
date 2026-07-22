@@ -34,6 +34,9 @@ Excluded until V2/V3:
 | Fixed Mixed-Test-1K generation | `scripts/generate_mixed_test_1k.py` |
 | Continuous metadata labels | `RestorationSourceDataset`, `metadata.json` strengths |
 | V1 category-balanced sampling | `configs/train_v1_minimal.yaml`, `build_balanced_sampler` |
+| Three-stage schedule | `configs/train_v1_stage1.yaml`, `train_v1_stage2.yaml`, `train_v1_stage3.yaml` |
+| Stage-specific metadata filtering | `RestorationSourceDataset` `include_groups` / degradation-count filters |
+| Cross-stage model initialization | `train.py::load_initial_model_weights`, `--init-checkpoint` |
 | Shared Feature Encoder `E` | `models/backbone/nafnet_backbone.py::NAFNetSharedEncoder` |
 | Multi-scale features `F1...F4` | `NAFNetSharedEncoder.forward` |
 | Shallow image statistics `phi(I)` | `models/tokenizer/degradation_tokenizer.py::_image_statistics` |
@@ -59,6 +62,18 @@ Excluded until V2/V3:
 | `L_cls` | BCE over dense/sparse degradation labels |
 | `L_proto` | Prototype diversity + multi-label composition alignment |
 | `L_sparse` | Sparse-mask presence, coverage, and TV regularization |
+
+## Training Stages
+
+| Stage | Samples | Iterations | Initialization |
+| --- | --- | ---: | --- |
+| Stage 1 | Single degradation only | 60,000 | New model |
+| Stage 2 | Full balanced single + composite distribution | 140,000 | Stage 1 `best.pth`, model only |
+| Stage 3 | Dense+dense, dense+sparse and triple only | 40,000 | Stage 2 `best.pth`, model only |
+
+Within-stage interruption recovery uses `--resume`, which restores the model,
+optimizer, scheduler, scaler and iteration. A cross-stage transition uses model
+weights only and starts the new stage schedule at iteration zero.
 
 ## Labels
 

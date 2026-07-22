@@ -72,7 +72,7 @@ def report_sampling(train_sources, source_configs, seed: int, draws: int) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit all configured restoration training sources")
-    parser.add_argument("--config", default="configs/train_v1_minimal.yaml")
+    parser.add_argument("--config", default="configs/train_v1_stage1.yaml")
     parser.add_argument(
         "--check-sizes",
         action="store_true",

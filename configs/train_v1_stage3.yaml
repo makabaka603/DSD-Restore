@@ -1,0 +1,47 @@
+base_config: train_v1_minimal.yaml
+
+stage:
+  name: stage3
+  objective: composite_degradation_finetuning
+  init_from_stage: stage2
+
+experiment:
+  name: v1_stage3_composite
+  output_dir: experiments/v1_stage3_composite
+
+data:
+  # Conditional distribution among composite samples remains 50% dense+dense,
+  # 40% dense+sparse and 10% triple, matching Stage 2 after singles are removed.
+  train_sources:
+    - name: synthetic_composite_train
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [dense_dense, dense_sparse, triple]
+      min_degradations: 2
+      probability: 1.0
+
+  val_sources:
+    - name: synthetic_composite_val
+      input_dir: datasets/SyntheticCompositeVal/input
+      gt_dir: datasets/SyntheticCompositeVal/gt
+      metadata_path: datasets/SyntheticCompositeVal/metadata.json
+      require_metadata: true
+      include_groups: [dense_dense, dense_sparse, triple]
+      min_degradations: 2
+      max_samples: 1000
+
+optimization:
+  max_iters: 40000
+  lr: 0.00005
+  min_lr: 0.0000005
+  warmup_iters: 1000
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage2_joint/best.pth
+  save_every_iters: 2000
+  early_stop_patience_iters: 0
+  tensorboard:
+    run_name: v1_stage3_composite

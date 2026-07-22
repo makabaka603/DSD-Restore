@@ -18,7 +18,7 @@ implemented here. Physics-frequency fusion and real no-GT adaptation remain V2/V
 
 ## Recommended Hardware and Environment
 
-The default training configuration is tuned as a starting point for one **NVIDIA GeForce RTX 5090 (32 GB)** on Windows:
+The training configurations are tuned as a starting point for one **NVIDIA GeForce RTX 5090 (32 GB)**:
 
 - Python 3.10 or later
 - A current NVIDIA display driver
@@ -38,15 +38,16 @@ The GPU should be reported as RTX 5090 and the architecture list should include 
 
 ## RTX 5090 Training Configuration
 
-The default settings are stored in `configs/train_v1_minimal.yaml`:
+Common settings live in `configs/train_v1_minimal.yaml`; formal runs use the
+three `configs/train_v1_stage*.yaml` files:
 
 | Setting | Default | Notes |
 | --- | ---: | --- |
 | Crop size | 256 x 256 | Random paired crop |
 | Batch size | 16 | Reduce to 8 if real data causes OOM |
-| Data workers | 4 | Try 8 only if storage and CPU can keep up |
-| Maximum iterations | 75,000 | Iteration-based, independent of dataset size |
-| Warmup | 3,000 iterations | Linear warmup |
+| Data workers | 8 | Reduce if storage or CPU cannot keep up |
+| Stage iterations | 60k / 140k / 40k | Single pretrain / joint train / composite fine-tune |
+| Warmup | 3k / 5k / 1k | Reset at every stage |
 | Optimizer | AdamW | Learning rate `2e-4`, weight decay `1e-4` |
 | Scheduler | Cosine decay | Minimum learning rate `1e-6` |
 | Mixed precision | BF16 AMP | Automatically falls back to FP16 if BF16 is unavailable |
@@ -55,7 +56,7 @@ The default settings are stored in `configs/train_v1_minimal.yaml`:
 | Probe validation | Every 100 iterations | 2 fixed 256px center crops per source |
 | Selection validation | Every 500 iterations | 10 fixed 256px center crops per source |
 | Checkpoint | Every 100 iterations | Best validated state in each 100-iteration window |
-| Early stopping | 15,000 iterations | Stops if validation PSNR does not improve |
+| Early stopping | Disabled | Each formal stage completes its specified iteration count |
 
 The corrected NAFNet-style V1 model contains about 10.06 million parameters.
 Batch size 16 is the single-RTX-5090 physical/effective batch, with no gradient
@@ -160,7 +161,7 @@ once experiments begin.
 Evaluate a generated copy with per-combination metrics:
 
 ```bash
-python test.py --config configs/train_v1_minimal.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth --test-input-dir datasets/Synthetic-Mixed-Test-1K/input --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json
+python test.py --config configs/train_v1_stage3.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth --test-input-dir datasets/Synthetic-Mixed-Test-1K/input --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json
 ```
 
 Before a formal run, audit paths, train/validation leakage, sampling ratios, and
@@ -168,8 +169,12 @@ every paired image size:
 
 ```bash
 python scripts/audit_offline_composite_data.py --check-sizes
-python scripts/audit_training_data.py --check-sizes
-python scripts/smoke_test_data_pipeline.py --num-workers 8
+python scripts/audit_training_data.py --config configs/train_v1_stage1.yaml
+python scripts/audit_training_data.py --config configs/train_v1_stage2.yaml
+python scripts/audit_training_data.py --config configs/train_v1_stage3.yaml
+python scripts/smoke_test_data_pipeline.py --config configs/train_v1_stage1.yaml --num-workers 8
+python scripts/smoke_test_data_pipeline.py --config configs/train_v1_stage2.yaml --num-workers 8
+python scripts/smoke_test_data_pipeline.py --config configs/train_v1_stage3.yaml --num-workers 8
 ```
 
 The first audit verifies input/GT/metadata parity, label ranges, exact test-set
@@ -178,11 +183,35 @@ can omit `--check-sizes`.
 
 ## Train
 
-Start a new training run:
+V1 training is three independent iteration schedules. A stage transition loads
+model weights only; it deliberately creates a fresh optimizer, scheduler, AMP
+scaler, best metric and iteration counter.
 
-```powershell
-python train.py --config configs/train_v1_minimal.yaml
+Stage 1 pretrains all model parameters for 60k iterations on single-degradation
+samples only:
+
+```bash
+python train.py --config configs/train_v1_stage1.yaml
 ```
+
+Stage 2 automatically initializes from the Stage 1 `best.pth`, then jointly
+trains the complete V1 distribution for 140k new iterations:
+
+```bash
+python train.py --config configs/train_v1_stage2.yaml
+```
+
+Stage 3 automatically initializes from the Stage 2 `best.pth`, filters the
+offline dataset to dense+dense, dense+sparse and triple mixtures, and fine-tunes
+for 40k new iterations at `5e-5`:
+
+```bash
+python train.py --config configs/train_v1_stage3.yaml
+```
+
+The default initializer can be replaced explicitly with
+`--init-checkpoint /path/to/best.pth`. The checkpoint must carry the expected
+source-stage label; an incorrect Stage 1-to-Stage 3 jump is rejected.
 
 Validation reports PSNR, SSIM, LPIPS, and DISTS per degradation task. A small,
 deterministic probe set runs every 100 iterations and saves the corresponding
@@ -215,30 +244,40 @@ Start the UI with:
 tensorboard --logdir /root/tf-logs --port 6006 --bind_all
 ```
 
-Checkpoints are written to the data disk at
-`/root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/`:
+Checkpoints are written to three separate data-disk directories:
+
+```text
+/root/autodl-tmp/DSD-Restor-checkpoints/v1_stage1_single/
+/root/autodl-tmp/DSD-Restor-checkpoints/v1_stage2_joint/
+/root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/
+```
+
+Each directory contains:
 
 - `best.pth`: highest validation PSNR over the complete run (compact model weights)
 - `latest.pth`: latest resumable state
 - `window_XXXXXXX_XXXXXXX_best.pth`: compact best weights in each 100-iteration window
 - `iter_XXXXXXX.pth`: periodic snapshots
 
-Resume a stopped run while preserving the optimizer, scheduler, AMP scaler, iteration, and best metric:
+Resume an interrupted stage while preserving its optimizer, scheduler, AMP
+scaler, iteration and best metric:
 
-```powershell
-python train.py --config configs/train_v1_minimal.yaml --resume /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/latest.pth
+```bash
+python train.py --config configs/train_v1_stage1.yaml --resume /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage1_single/latest.pth
 ```
 
-The configured `max_iters` is the total target. For example, resuming at iteration 50,000 with `max_iters: 75000` performs the remaining 25,000 iterations.
+`--resume` is only for the same stage and restores its existing iteration.
+`--init-checkpoint` is only for starting a new stage and resets the iteration to
+zero. The trainer checks stage labels to prevent mixing these two operations.
 
 ## Test
 
-```powershell
-python test.py --config configs/train_v1_minimal.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth
+```bash
+python test.py --config configs/train_v1_stage3.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth
 ```
 
 ## Inference
 
-```powershell
-python infer_real.py --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth --input data/real --output results/real_v1
+```bash
+python infer_real.py --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth --input data/real --output results/real_v1
 ```

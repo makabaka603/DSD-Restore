@@ -1,0 +1,98 @@
+base_config: train_v1_minimal.yaml
+
+stage:
+  name: stage1
+  objective: single_degradation_pretraining
+  init_from_stage: null
+
+experiment:
+  name: v1_stage1_single
+  output_dir: experiments/v1_stage1_single
+
+data:
+  # Seven observed single degradations are balanced at roughly 1/7 each.
+  # The synthetic source contains dust, sand and colorcast in equal counts;
+  # the two LOLv2 sources together form the low-light share.
+  train_sources:
+    - name: snow100k
+      input_dir: datasets/Snow100K/train/input
+      gt_dir: datasets/Snow100K/train/gt
+      task: snow
+      probability: 0.142857
+    - name: rain13k
+      input_dir: datasets/Rain13K/train/input
+      gt_dir: datasets/Rain13K/train/target
+      task: rain
+      probability: 0.142857
+    - name: reside6k
+      input_dir: datasets/RESIDE-6K/train/hazy
+      gt_dir: datasets/RESIDE-6K/train/GT
+      task: haze
+      probability: 0.142857
+    - name: lolv2_real
+      input_dir: datasets/LOLv2_real/Train/Input
+      gt_dir: datasets/LOLv2_real/Train/GT
+      task: lowlight
+      probability: 0.071429
+    - name: lolv2_synthetic
+      input_dir: datasets/LOLv2_synthetic/Train/Input
+      gt_dir: datasets/LOLv2_synthetic/Train/GT
+      task: lowlight
+      probability: 0.071429
+    - name: synthetic_single_train
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [single_dense]
+      max_degradations: 1
+      probability: 0.428571
+
+  val_sources:
+    - name: snow100k_val
+      input_dir: datasets/Snow100K/val/input
+      gt_dir: datasets/Snow100K/val/gt
+      task: snow
+      max_samples: 10
+    - name: rain13k_val
+      input_dir: datasets/Rain13K/test/Test100/input
+      gt_dir: datasets/Rain13K/test/Test100/target
+      task: rain
+      max_samples: 10
+    - name: reside6k_val
+      input_dir: datasets/RESIDE-6K/test/hazy
+      gt_dir: datasets/RESIDE-6K/test/GT
+      task: haze
+      max_samples: 10
+    - name: lolv2_real_val
+      input_dir: datasets/LOLv2_real/Test/Input
+      gt_dir: datasets/LOLv2_real/Test/GT
+      task: lowlight
+      max_samples: 10
+    - name: lolv2_synthetic_val
+      input_dir: datasets/LOLv2_synthetic/Test/Input
+      gt_dir: datasets/LOLv2_synthetic/Test/GT
+      gt_strip_input_prefix: r
+      task: lowlight
+      max_samples: 10
+    - name: synthetic_single_val
+      input_dir: datasets/SyntheticCompositeVal/input
+      gt_dir: datasets/SyntheticCompositeVal/gt
+      metadata_path: datasets/SyntheticCompositeVal/metadata.json
+      require_metadata: true
+      include_groups: [single_dense]
+      max_degradations: 1
+      max_samples: 200
+
+optimization:
+  max_iters: 60000
+  lr: 0.0002
+  min_lr: 0.000001
+  warmup_iters: 3000
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage1_single
+  init_checkpoint: null
+  early_stop_patience_iters: 0
+  tensorboard:
+    run_name: v1_stage1_single

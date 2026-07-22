@@ -303,6 +303,41 @@ def build_scheduler(optim: AdamW, max_iters: int, warmup_iters: int, min_lr: flo
     return LambdaLR(optim, lr_lambda=lr_multiplier)
 
 
+def stage_name(config: dict) -> str | None:
+    stage = config.get("stage", {})
+    return stage.get("name") if isinstance(stage, dict) else None
+
+
+def checkpoint_stage_name(checkpoint: dict) -> str | None:
+    checkpoint_config = checkpoint.get("config", {}) if isinstance(checkpoint, dict) else {}
+    return stage_name(checkpoint_config) if isinstance(checkpoint_config, dict) else None
+
+
+def load_initial_model_weights(
+    model: torch.nn.Module,
+    checkpoint_path: str | Path,
+    config: dict,
+) -> str | None:
+    """Initialize a new stage from model weights without optimizer state."""
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Initial checkpoint not found: {path}")
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise TypeError(f"Initial checkpoint does not contain a model state dict: {path}")
+
+    expected_stage = config.get("stage", {}).get("init_from_stage")
+    source_stage = checkpoint_stage_name(checkpoint)
+    if expected_stage and source_stage != expected_stage:
+        found = source_stage or "unlabeled checkpoint"
+        raise ValueError(
+            f"Stage {stage_name(config)} must initialize from {expected_stage}, found {found}: {path}"
+        )
+    model.load_state_dict(state_dict, strict=True)
+    return source_stage
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -356,7 +391,11 @@ def save_weights(
     )
 
 
-def train(cfg: dict, resume: str | None = None) -> None:
+def train(
+    cfg: dict,
+    resume: str | None = None,
+    init_checkpoint: str | None = None,
+) -> None:
     try:
         from torch.utils.tensorboard import SummaryWriter
     except ImportError as exc:
@@ -391,8 +430,21 @@ def train(cfg: dict, resume: str | None = None) -> None:
             "Provide degradation labels or set loss.lambda_cls to 0.0."
         )
 
+    resume_path = resume or cfg["runtime"].get("resume")
+    configured_init = init_checkpoint or cfg["runtime"].get("init_checkpoint")
+    # Resuming restores the full state of the current stage. Its configured
+    # cross-stage initializer must not be applied a second time.
+    initial_path = None if resume_path else configured_init
+
     channels_last_enabled = cfg["runtime"].get("channels_last", False) and device.type == "cuda"
-    model = DSDRestoreV1(**cfg["model"]).to(device)
+    model = DSDRestoreV1(**cfg["model"])
+    if initial_path:
+        source_stage = load_initial_model_weights(model, initial_path, cfg)
+        print(
+            f"Initialized {stage_name(cfg) or 'training'} from {initial_path} "
+            f"(source stage: {source_stage or 'unlabeled'}); optimizer and iteration reset."
+        )
+    model = model.to(device)
     if channels_last_enabled:
         model = model.to(memory_format=torch.channels_last)
     perceptual = PerceptualMetrics(device)
@@ -416,9 +468,15 @@ def train(cfg: dict, resume: str | None = None) -> None:
     last_metrics = {name: float("nan") for name in ("psnr", "ssim", "lpips", "dists")}
     running_best = {"psnr": -math.inf, "ssim": -math.inf, "lpips": math.inf, "dists": math.inf}
 
-    resume_path = resume or cfg["runtime"].get("resume")
     if resume_path:
         checkpoint = torch.load(resume_path, map_location=device)
+        current_stage = stage_name(cfg)
+        resumed_stage = checkpoint_stage_name(checkpoint)
+        if current_stage and resumed_stage and current_stage != resumed_stage:
+            raise ValueError(
+                f"Cannot resume {current_stage} from a {resumed_stage} checkpoint. "
+                "Use --init-checkpoint for a stage transition."
+            )
         model.load_state_dict(checkpoint["model"])
         optim.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
@@ -457,7 +515,8 @@ def train(cfg: dict, resume: str | None = None) -> None:
     )
 
     print(
-        f"device={device} amp={amp_enabled} amp_dtype={amp_dtype} "
+        f"stage={stage_name(cfg) or 'unlabeled'} device={device} "
+        f"amp={amp_enabled} amp_dtype={amp_dtype} "
         f"batch_size={cfg['data']['batch_size']} max_iters={max_iters} "
         f"channels_last={channels_last_enabled} compile={active_model is not model}"
     )
@@ -703,10 +762,24 @@ def train(cfg: dict, resume: str | None = None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/train_v1_minimal.yaml")
-    parser.add_argument("--resume", default=None, help="checkpoint path used to resume training")
+    parser.add_argument("--config", default="configs/train_v1_stage1.yaml")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume",
+        default=None,
+        help="resume the same stage with model, optimizer, scheduler, scaler, and iteration",
+    )
+    checkpoint_group.add_argument(
+        "--init-checkpoint",
+        default=None,
+        help="start a new stage from model weights only; optimizer and iteration reset",
+    )
     args = parser.parse_args()
-    train(load_config(args.config), resume=args.resume)
+    train(
+        load_config(args.config),
+        resume=args.resume,
+        init_checkpoint=args.init_checkpoint,
+    )
 
 
 if __name__ == "__main__":
