@@ -5,6 +5,7 @@ from .multi_source_restoration_dataset import (
     RestorationSourceDataset,
     build_balanced_sampler,
     build_source_dataset,
+    synthesize_composite_degradation,
     synthesize_degradation,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "build_balanced_sampler",
     "build_source_dataset",
     "synthesize_degradation",
+    "synthesize_composite_degradation",
     "DENSE_KEYS",
     "SPARSE_KEYS",
 ]

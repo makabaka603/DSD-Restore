@@ -8,7 +8,7 @@ from torchvision.transforms import functional as TF
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from datasets import synthesize_degradation
+from datasets import synthesize_composite_degradation
 
 
 def fit_preview(image: Image.Image, size: int = 384) -> Image.Image:
@@ -36,13 +36,24 @@ def main() -> None:
             raise FileNotFoundError("No DIV2K training images found")
         input_path = candidates[0]
     clean_image = Image.open(input_path).convert("RGB")
-    clean = TF.to_tensor(clean_image)
+    # Synthesize at the displayed scale so sparse rain/snow elements are not
+    # erased by thumbnailing a much larger DIV2K image afterward.
+    clean_preview = fit_preview(clean_image)
+    clean = TF.to_tensor(clean_preview)
 
-    panels = [("clean", fit_preview(clean_image))]
-    for offset, degradation in enumerate(("dust", "sand", "colorcast")):
+    panels = [("clean", clean_preview)]
+    preview_tasks = (
+        ("dust",),
+        ("sand",),
+        ("haze", "lowlight"),
+        ("haze", "rain"),
+        ("lowlight", "snow"),
+        ("dust", "lowlight", "rain"),
+    )
+    for offset, tasks in enumerate(preview_tasks):
         generator = torch.Generator().manual_seed(args.seed + offset)
-        degraded = synthesize_degradation(clean, degradation, generator)
-        panels.append((degradation, fit_preview(TF.to_pil_image(degraded))))
+        degraded, _ = synthesize_composite_degradation(clean, tasks, generator)
+        panels.append(("+".join(tasks), fit_preview(TF.to_pil_image(degraded))))
 
     label_height = 36
     montage = Image.new("RGB", (384 * len(panels), 384 + label_height), "white")

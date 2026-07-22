@@ -29,8 +29,207 @@ def _label_vector(tasks: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
     return dense, sparse
 
 
+def _strength_vector(strengths: dict[str, float]) -> tuple[torch.Tensor, torch.Tensor]:
+    dense = torch.tensor(
+        [float(strengths.get(key, 0.0)) for key in DENSE_KEYS], dtype=torch.float32
+    )
+    sparse = torch.tensor(
+        [float(strengths.get(key, 0.0)) for key in SPARSE_KEYS], dtype=torch.float32
+    )
+    return dense.clamp(0, 1), sparse.clamp(0, 1)
+
+
 def _uniform(generator: torch.Generator, low: float, high: float) -> float:
     return low + (high - low) * float(torch.rand((), generator=generator))
+
+
+def _smooth_random_field(
+    image: torch.Tensor,
+    generator: torch.Generator,
+    min_grid: int = 2,
+    max_grid: int = 8,
+) -> torch.Tensor:
+    _, height, width = image.shape
+    grid_h = max(2, min(8, height // 64))
+    grid_w = max(2, min(8, width // 64))
+    grid_h = max(min_grid, min(max_grid, grid_h))
+    grid_w = max(min_grid, min(max_grid, grid_w))
+    field = torch.rand((1, 1, grid_h, grid_w), generator=generator, dtype=image.dtype)
+    field = F.interpolate(field, size=(height, width), mode="bicubic", align_corners=False)[0]
+    return (field - field.amin()) / (field.amax() - field.amin() + 1e-6)
+
+
+def _apply_dust_or_sand(
+    image: torch.Tensor,
+    degradation: str,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    field = _smooth_random_field(image, generator)
+    strength = _uniform(generator, 0.35, 0.85)
+
+    if degradation == "dust":
+        base_transmission = 0.86 - 0.50 * strength
+        transmission = base_transmission + field * _uniform(generator, 0.08, 0.22)
+        atmosphere = torch.tensor(
+            [
+                _uniform(generator, 0.78, 0.96),
+                _uniform(generator, 0.60, 0.82),
+                _uniform(generator, 0.38, 0.62),
+            ],
+            dtype=image.dtype,
+        ).view(3, 1, 1)
+        noise_std = _uniform(generator, 0.003, 0.012) * strength
+    else:
+        base_transmission = 0.78 - 0.48 * strength
+        transmission = base_transmission + field * _uniform(generator, 0.06, 0.18)
+        atmosphere = torch.tensor(
+            [
+                _uniform(generator, 0.86, 1.0),
+                _uniform(generator, 0.68, 0.88),
+                _uniform(generator, 0.30, 0.52),
+            ],
+            dtype=image.dtype,
+        ).view(3, 1, 1)
+        noise_std = _uniform(generator, 0.008, 0.025) * strength
+
+    transmission = transmission.clamp(0.25, 0.92)
+    degraded = image * transmission + atmosphere * (1.0 - transmission)
+    noise = torch.randn(image.shape, generator=generator, dtype=image.dtype) * noise_std
+    return (degraded + noise).clamp(0, 1), strength
+
+
+def _apply_haze(
+    image: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    strength = _uniform(generator, 0.20, 0.80)
+    field = _smooth_random_field(image, generator)
+    transmission = (1.0 - 0.65 * strength) + (field - 0.5) * 0.12
+    transmission = transmission.clamp(0.25, 0.95)
+    atmospheric_light = torch.tensor(
+        [_uniform(generator, 0.82, 1.0) for _ in range(3)], dtype=image.dtype
+    ).view(3, 1, 1)
+    degraded = image * transmission + atmospheric_light * (1.0 - transmission)
+    return degraded.clamp(0, 1), strength
+
+
+def _apply_lowlight(
+    image: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    strength = _uniform(generator, 0.25, 0.85)
+    illumination = _smooth_random_field(image, generator, min_grid=2, max_grid=5)
+    illumination = (0.30 + 0.55 * illumination) * (1.0 - 0.45 * strength)
+    gamma = 1.0 + 1.6 * strength
+    degraded = image.clamp_min(1e-6).pow(gamma) * illumination
+    noise_std = 0.003 + 0.025 * strength
+    noise = torch.randn(image.shape, generator=generator, dtype=image.dtype) * noise_std
+    return (degraded + noise).clamp(0, 1), strength
+
+
+def _apply_colorcast(
+    image: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    strength = _uniform(generator, 0.20, 0.75)
+    warm = float(torch.rand((), generator=generator)) < 0.65
+    if warm:
+        target_gains = torch.tensor([1.30, 1.08, 0.72], dtype=image.dtype)
+    else:
+        target_gains = torch.tensor([0.78, 1.02, 1.25], dtype=image.dtype)
+    gains = 1.0 + (target_gains - 1.0) * strength
+    return (image * gains.view(3, 1, 1)).clamp(0, 1), strength
+
+
+def _apply_rain(
+    image: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    _, height, width = image.shape
+    strength = _uniform(generator, 0.20, 0.80)
+    density = 0.002 + 0.008 * strength
+    impulses = (
+        torch.rand((1, 1, height, width), generator=generator, dtype=image.dtype) < density
+    ).to(image.dtype)
+    length = 9 + 2 * int(round(7 * strength))
+    kernel = torch.zeros((1, 1, length, length), dtype=image.dtype)
+    direction = int(torch.randint(0, 3, (), generator=generator).item())
+    if direction == 0:
+        kernel[0, 0, :, length // 2] = 1.0
+    elif direction == 1:
+        kernel[0, 0].diagonal().fill_(1.0)
+    else:
+        kernel[0, 0] = torch.fliplr(torch.eye(length, dtype=image.dtype))
+    kernel /= kernel.sum().clamp_min(1.0)
+    streaks = F.conv2d(impulses, kernel, padding=length // 2)[0]
+    streaks = streaks / streaks.amax().clamp_min(1e-6)
+    alpha = streaks * (0.10 + 0.30 * strength)
+    rain_color = torch.tensor([0.82, 0.88, 0.95], dtype=image.dtype).view(3, 1, 1)
+    degraded = image * (1.0 - alpha) + rain_color * alpha
+    return degraded.clamp(0, 1), strength
+
+
+def _apply_snow(
+    image: torch.Tensor,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    _, height, width = image.shape
+    strength = _uniform(generator, 0.20, 0.80)
+    # Snow is a sparse occlusion. Keep the seed density low because pooling
+    # expands every seed into a visible flake.
+    density = 0.00015 + 0.0010 * strength
+    impulses = (
+        torch.rand((1, 1, height, width), generator=generator, dtype=image.dtype) < density
+    ).to(image.dtype)
+    small = F.max_pool2d(impulses, kernel_size=3, stride=1, padding=1)
+    large = F.max_pool2d(impulses, kernel_size=5, stride=1, padding=2)
+    flakes = (0.72 * small + 0.28 * large).clamp(0, 1)[0]
+    alpha = flakes * (0.16 + 0.46 * strength)
+    degraded = image * (1.0 - alpha) + alpha
+    return degraded.clamp(0, 1), strength
+
+
+def _apply_degradation(
+    image: torch.Tensor,
+    degradation: str,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, float]:
+    if degradation in {"dust", "sand"}:
+        return _apply_dust_or_sand(image, degradation, generator)
+    if degradation == "haze":
+        return _apply_haze(image, generator)
+    if degradation == "lowlight":
+        return _apply_lowlight(image, generator)
+    if degradation == "colorcast":
+        return _apply_colorcast(image, generator)
+    if degradation == "rain":
+        return _apply_rain(image, generator)
+    if degradation == "snow":
+        return _apply_snow(image, generator)
+    raise ValueError(f"Unsupported synthetic degradation: {degradation}")
+
+
+def synthesize_composite_degradation(
+    clean: torch.Tensor,
+    degradations: list[str] | tuple[str, ...],
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Apply dense degradations first and sparse occlusions last.
+
+    Returns the degraded CHW tensor and continuous labels in [0, 1].
+    """
+    requested = list(dict.fromkeys(degradations))
+    unknown = sorted(set(requested) - set(DENSE_KEYS) - set(SPARSE_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown synthetic degradations: {unknown}")
+    strengths = {key: 0.0 for key in (*DENSE_KEYS, *SPARSE_KEYS)}
+    degraded = clean
+    for degradation in (*DENSE_KEYS, *SPARSE_KEYS):
+        if degradation not in requested:
+            continue
+        degraded, strength = _apply_degradation(degraded, degradation, generator)
+        strengths[degradation] = strength
+    return degraded.clamp(0, 1), strengths
 
 
 def synthesize_degradation(
@@ -38,55 +237,9 @@ def synthesize_degradation(
     degradation: str,
     generator: torch.Generator,
 ) -> torch.Tensor:
-    """Generate a paired dense degradation from a clean CHW tensor in [0, 1]."""
-    if degradation == "colorcast":
-        gains = torch.tensor(
-            [_uniform(generator, 0.65, 1.35) for _ in range(3)],
-            dtype=clean.dtype,
-        ).view(3, 1, 1)
-        if float((gains - 1.0).abs().max()) < 0.12:
-            gains[0] = 1.25
-            gains[2] = 0.78
-        gamma = _uniform(generator, 0.85, 1.2)
-        return (clean.clamp_min(1e-6).pow(gamma) * gains).clamp(0, 1)
-
-    if degradation not in {"dust", "sand"}:
-        raise ValueError(f"Unsupported synthetic degradation: {degradation}")
-
-    _, height, width = clean.shape
-    grid_h = max(2, min(8, height // 64))
-    grid_w = max(2, min(8, width // 64))
-    field = torch.rand((1, 1, grid_h, grid_w), generator=generator, dtype=clean.dtype)
-    field = F.interpolate(field, size=(height, width), mode="bicubic", align_corners=False)[0]
-    field = (field - field.amin()) / (field.amax() - field.amin() + 1e-6)
-
-    if degradation == "dust":
-        transmission = _uniform(generator, 0.48, 0.72) + field * _uniform(generator, 0.08, 0.22)
-        atmosphere = torch.tensor(
-            [
-                _uniform(generator, 0.78, 0.96),
-                _uniform(generator, 0.60, 0.82),
-                _uniform(generator, 0.38, 0.62),
-            ],
-            dtype=clean.dtype,
-        ).view(3, 1, 1)
-        noise_std = _uniform(generator, 0.003, 0.012)
-    else:
-        transmission = _uniform(generator, 0.38, 0.62) + field * _uniform(generator, 0.06, 0.18)
-        atmosphere = torch.tensor(
-            [
-                _uniform(generator, 0.86, 1.0),
-                _uniform(generator, 0.68, 0.88),
-                _uniform(generator, 0.30, 0.52),
-            ],
-            dtype=clean.dtype,
-        ).view(3, 1, 1)
-        noise_std = _uniform(generator, 0.008, 0.025)
-
-    transmission = transmission.clamp(0.25, 0.92)
-    degraded = clean * transmission + atmosphere * (1.0 - transmission)
-    noise = torch.randn(clean.shape, generator=generator, dtype=clean.dtype) * noise_std
-    return (degraded + noise).clamp(0, 1)
+    """Backward-compatible single-degradation wrapper."""
+    degraded, _ = synthesize_composite_degradation(clean, [degradation], generator)
+    return degraded
 
 
 class RestorationSourceDataset(Dataset):
@@ -100,13 +253,17 @@ class RestorationSourceDataset(Dataset):
         self.name = config["name"]
         self.tasks = config.get("tasks", [config.get("task")])
         self.tasks = [task for task in self.tasks if task]
+        self.mixtures = [tuple(mixture) for mixture in config.get("mixtures", [])]
+        for mixture in self.mixtures:
+            _label_vector(list(mixture))
         self.dense_label, self.sparse_label = _label_vector(self.tasks)
         self.crop_size = crop_size
         self.training = training
         self.seed = seed
         self.synthetic = config.get("synthetic")
+        self.clean_source = bool(self.synthetic or self.mixtures)
 
-        if self.synthetic:
+        if self.clean_source:
             clean_dir = Path(config["clean_dir"])
             if not clean_dir.exists():
                 raise FileNotFoundError(f"Clean image folder not found for {self.name}: {clean_dir}")
@@ -161,7 +318,10 @@ class RestorationSourceDataset(Dataset):
                 target = opened_target.convert("RGB")
         image, target = self._paired_transform(image, target)
 
-        if self.synthetic:
+        active_tasks = self.tasks
+        dense_label = self.dense_label
+        sparse_label = self.sparse_label
+        if self.clean_source:
             if self.training:
                 # DataLoader seeds each worker's global torch RNG. Drawing the
                 # per-sample seed from it keeps augmentation random and reproducible.
@@ -171,16 +331,26 @@ class RestorationSourceDataset(Dataset):
                 generator = torch.Generator().manual_seed(
                     _stable_seed(self.name, input_path.name, base_seed=self.seed)
                 )
-            image = synthesize_degradation(target, self.synthetic, generator)
+            if self.mixtures:
+                mixture_index = int(
+                    torch.randint(0, len(self.mixtures), (), generator=generator).item()
+                )
+                active_tasks = list(self.mixtures[mixture_index])
+            else:
+                active_tasks = [self.synthetic]
+            image, strengths = synthesize_composite_degradation(
+                target, active_tasks, generator
+            )
+            dense_label, sparse_label = _strength_vector(strengths)
 
         return {
             "input": image,
             "gt": target,
-            "dense_label": self.dense_label.clone(),
-            "sparse_label": self.sparse_label.clone(),
+            "dense_label": dense_label.clone(),
+            "sparse_label": sparse_label.clone(),
             "name": input_path.name,
             "source": self.name,
-            "task": "+".join(self.tasks),
+            "task": "+".join(active_tasks),
         }
 
     def _paired_transform(self, image: Image.Image, target: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:

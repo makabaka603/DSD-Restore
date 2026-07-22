@@ -25,17 +25,25 @@ def main() -> None:
     train_loader, _ = build_loaders(cfg)
 
     source_counts = Counter()
+    task_counts = Counter()
     first_batch = None
     for batch in train_loader:
         if first_batch is None:
             first_batch = batch
         source_counts.update(batch["source"])
+        task_counts.update(batch["task"])
     if first_batch is None:
         raise RuntimeError("The training loader returned no batches")
     if first_batch["input"].shape != first_batch["gt"].shape:
         raise ValueError("Input and GT batch shapes differ")
     if first_batch["dense_label"].shape[1] != 5 or first_batch["sparse_label"].shape[1] != 4:
         raise ValueError("Unexpected degradation label dimensions")
+    if not any("+" in task for task in task_counts):
+        raise ValueError("No composite degradation was sampled")
+    for key in ("dense_label", "sparse_label"):
+        labels = first_batch[key]
+        if float(labels.min()) < 0.0 or float(labels.max()) > 1.0:
+            raise ValueError(f"{key} contains values outside [0, 1]")
 
     # Keep the backward pass quick while still using a real mixed-source batch.
     model = DSDRestoreV1(base_channels=16, token_dim=32)
@@ -52,6 +60,7 @@ def main() -> None:
     print("Data pipeline smoke test passed")
     print(f"batch shape: {tuple(first_batch['input'].shape)}")
     print(f"sources observed in 40 draws: {dict(sorted(source_counts.items()))}")
+    print(f"tasks observed in 40 draws: {dict(sorted(task_counts.items()))}")
     print(f"loss: {float(losses['total'].detach()):.4f}")
 
 

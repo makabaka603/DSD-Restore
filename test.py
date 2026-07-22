@@ -17,6 +17,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/train_v1_minimal.yaml")
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--test-input-dir", default=None)
+    parser.add_argument("--test-gt-dir", default=None)
+    parser.add_argument("--test-metadata", default=None)
     parser.add_argument(
         "--max-samples-per-source",
         type=int,
@@ -36,7 +39,16 @@ def main() -> None:
         cfg["runtime"].get("amp", False),
         cfg["runtime"].get("amp_dtype", "bfloat16"),
     )
-    if cfg["data"].get("val_sources"):
+    if bool(args.test_input_dir) != bool(args.test_gt_dir):
+        raise ValueError("--test-input-dir and --test-gt-dir must be provided together")
+    if args.test_input_dir:
+        dataset = PairedRestorationDataset(
+            args.test_input_dir,
+            args.test_gt_dir,
+            args.test_metadata,
+            training=False,
+        )
+    elif cfg["data"].get("val_sources"):
         test_sources = [dict(source) for source in cfg["data"]["val_sources"]]
         for source in test_sources:
             if args.max_samples_per_source > 0:

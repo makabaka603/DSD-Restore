@@ -23,45 +23,65 @@ data:
   # so source probability is independent of the number of files it contains.
   samples_per_epoch: 16000
   train_sources:
+    # V1 sampling follows the Word plan by degradation category:
+    # single dense 30%, single sparse 20%, dense+dense 25%,
+    # dense+sparse 20%, and three-degradation mixtures 5%.
     - name: snow100k
       input_dir: datasets/Snow100K/train/input
       gt_dir: datasets/Snow100K/train/gt
       task: snow
-      probability: 0.20
+      probability: 0.10
     - name: rain13k
       input_dir: datasets/Rain13K/train/input
       gt_dir: datasets/Rain13K/train/target
       task: rain
-      probability: 0.20
+      probability: 0.10
     - name: reside6k
       input_dir: datasets/RESIDE-6K/train/hazy
       gt_dir: datasets/RESIDE-6K/train/GT
       task: haze
-      probability: 0.20
+      probability: 0.10
     - name: lolv2_real
       input_dir: datasets/LOLv2_real/Train/Input
       gt_dir: datasets/LOLv2_real/Train/GT
       task: lowlight
-      probability: 0.125
+      probability: 0.05
     - name: lolv2_synthetic
       input_dir: datasets/LOLv2_synthetic/Train/Input
       gt_dir: datasets/LOLv2_synthetic/Train/GT
       task: lowlight
-      probability: 0.125
-    - name: div2k_dust
-      clean_dir: datasets/DIV2K_train_HR
-      synthetic: dust
-      task: dust
       probability: 0.05
-    - name: div2k_sand
+    - name: div2k_dense_single
       clean_dir: datasets/DIV2K_train_HR
-      synthetic: sand
-      task: sand
-      probability: 0.05
-    - name: div2k_colorcast
+      mixtures:
+        - [dust]
+        - [sand]
+        - [colorcast]
+      probability: 0.10
+    - name: div2k_dense_dense
       clean_dir: datasets/DIV2K_train_HR
-      synthetic: colorcast
-      task: colorcast
+      mixtures:
+        - [dust, haze]
+        - [dust, lowlight]
+        - [sand, haze]
+        - [haze, lowlight]
+      probability: 0.25
+    - name: div2k_dense_sparse
+      clean_dir: datasets/DIV2K_train_HR
+      mixtures:
+        - [dust, rain]
+        - [haze, rain]
+        - [lowlight, rain]
+        - [haze, snow]
+        - [lowlight, snow]
+      probability: 0.20
+    - name: div2k_triple
+      clean_dir: datasets/DIV2K_train_HR
+      mixtures:
+        - [dust, haze, lowlight]
+        - [dust, lowlight, rain]
+        - [haze, lowlight, rain]
+        - [haze, lowlight, snow]
       probability: 0.05
 
   # Validation is capped per task and reported as a macro average, preventing
@@ -108,6 +128,31 @@ data:
       clean_dir: datasets/DIV2K_valid_HR
       synthetic: colorcast
       task: colorcast
+      max_samples: 10
+    - name: div2k_dense_dense_val
+      clean_dir: datasets/DIV2K_valid_HR
+      mixtures:
+        - [dust, haze]
+        - [dust, lowlight]
+        - [sand, haze]
+        - [haze, lowlight]
+      max_samples: 10
+    - name: div2k_dense_sparse_val
+      clean_dir: datasets/DIV2K_valid_HR
+      mixtures:
+        - [dust, rain]
+        - [haze, rain]
+        - [lowlight, rain]
+        - [haze, snow]
+        - [lowlight, snow]
+      max_samples: 10
+    - name: div2k_triple_val
+      clean_dir: datasets/DIV2K_valid_HR
+      mixtures:
+        - [dust, haze, lowlight]
+        - [dust, lowlight, rain]
+        - [haze, lowlight, rain]
+        - [haze, lowlight, snow]
       max_samples: 10
 
   # RTX 5090 (32 GB) baseline. This is the physical and effective batch size;

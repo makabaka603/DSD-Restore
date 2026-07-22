@@ -33,7 +33,11 @@ class PairedRestorationDataset(Dataset):
             raise FileNotFoundError(f"No images found in {self.input_dir}")
         self.metadata = {}
         if metadata_path and Path(metadata_path).exists():
-            self.metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+            metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+            # Generated benchmarks store dataset-level information alongside
+            # per-file records under "samples". Legacy metadata is already a
+            # direct filename-to-label mapping.
+            self.metadata = metadata.get("samples", metadata)
 
     def __len__(self) -> int:
         return len(self.files)
@@ -46,13 +50,24 @@ class PairedRestorationDataset(Dataset):
         image = Image.open(input_path).convert("RGB")
         target = Image.open(gt_path).convert("RGB")
         image, target = self._paired_transform(image, target)
-        labels = self._labels(input_path.name)
+        meta = self.metadata.get(input_path.name, {})
+        labels = self._labels(meta)
+        tasks = meta.get("tasks")
+        if not tasks:
+            strengths = meta.get("strengths", meta)
+            tasks = [
+                key
+                for key in (*self.dense_keys, *self.sparse_keys)
+                if float(strengths.get(key, 0.0)) > 0
+            ]
         return {
             "input": image,
             "gt": target,
             "dense_label": labels["dense"],
             "sparse_label": labels["sparse"],
             "name": input_path.name,
+            "source": meta.get("category", "paired"),
+            "task": "+".join(tasks) if tasks else "mixed",
         }
 
     def _paired_transform(self, image: Image.Image, target: Image.Image) -> tuple[torch.Tensor, torch.Tensor]:
@@ -88,8 +103,12 @@ class PairedRestorationDataset(Dataset):
                     target = TF.vflip(target)
         return TF.to_tensor(image), TF.to_tensor(target)
 
-    def _labels(self, name: str) -> dict[str, torch.Tensor]:
-        meta = self.metadata.get(name, {})
-        dense = torch.tensor([float(meta.get(key, 0.0)) for key in self.dense_keys], dtype=torch.float32)
-        sparse = torch.tensor([float(meta.get(key, 0.0)) for key in self.sparse_keys], dtype=torch.float32)
+    def _labels(self, meta: dict) -> dict[str, torch.Tensor]:
+        strengths = meta.get("strengths", meta)
+        dense = torch.tensor(
+            [float(strengths.get(key, 0.0)) for key in self.dense_keys], dtype=torch.float32
+        )
+        sparse = torch.tensor(
+            [float(strengths.get(key, 0.0)) for key in self.sparse_keys], dtype=torch.float32
+        )
         return {"dense": dense.clamp(0, 1), "sparse": sparse.clamp(0, 1)}

@@ -91,17 +91,36 @@ datasets/
 
 Training probabilities are configured independently from dataset sizes:
 
-| Source | Probability |
+| Degradation category | Probability |
 | --- | ---: |
-| Snow100K | 20% |
-| Rain13K | 20% |
-| RESIDE-6K | 20% |
-| LOLv2 real + synthetic | 25% |
-| DIV2K online dust/sand/color-cast synthesis | 15% |
+| Single dense degradation | 30% |
+| Single sparse degradation | 20% |
+| Dense + dense composition | 25% |
+| Dense + sparse composition | 20% |
+| Three-degradation composition | 5% |
 
 DIV2K images are clean targets. Dense degradation inputs are generated online,
-with fixed seeds for validation. Dusty Images has no verified same-scene clean
-targets, so it is reserved for qualitative real-image inference.
+with fixed seeds for validation. Composite synthesis always applies dense
+degradations before sparse rain/snow occlusions and returns continuous
+multi-label strengths. Dusty Images has no verified same-scene clean targets,
+so it is reserved for qualitative real-image inference.
+
+Generate the fixed synthetic composite benchmark without overwriting an
+existing copy:
+
+```powershell
+python scripts/generate_mixed_test_1k.py --clean-dir datasets/DIV2K_valid_HR --output datasets/Synthetic-Mixed-Test-1K --size 512
+```
+
+The output contains 1,000 paired images plus `metadata.json`, following the
+combination counts in the V1 training plan. Keep the generated directory frozen
+once experiments begin.
+
+Evaluate a generated copy with per-combination metrics:
+
+```powershell
+python test.py --config configs/train_v1_minimal.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_minimal/best.pth --test-input-dir datasets/Synthetic-Mixed-Test-1K/input --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json
+```
 
 Before a formal run, audit paths, train/validation leakage, sampling ratios, and
 every paired image size:

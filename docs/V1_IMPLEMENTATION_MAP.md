@@ -29,7 +29,9 @@ Excluded until V2/V3:
 
 | Document / Figure module | Code |
 | --- | --- |
-| Input degraded image `I` | `train.py`, `datasets/paired_restoration_dataset.py` |
+| Input degraded image `I` | `train.py`, `datasets/multi_source_restoration_dataset.py` |
+| Online composite degradation | `synthesize_composite_degradation`, dense first then sparse |
+| V1 category-balanced sampling | `configs/train_v1_minimal.yaml`, `build_balanced_sampler` |
 | Shared Feature Encoder `E` | `models/backbone/nafnet_backbone.py::NAFNetSharedEncoder` |
 | Multi-scale features `F1...F4` | `NAFNetSharedEncoder.forward` |
 | Shallow image statistics `phi(I)` | `models/tokenizer/degradation_tokenizer.py::_image_statistics` |
@@ -69,6 +71,9 @@ Sparse labels:
 ```text
 rain, raindrop, snow, occlusion
 ```
+
+Synthetic composite samples use continuous labels sampled with the degradation
+parameters. Paired single-task sources retain binary source labels.
 
 Metadata example:
 
