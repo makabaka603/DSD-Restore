@@ -47,19 +47,16 @@ class DenseDegradationExpert(nn.Module):
             nn.Sigmoid(),
         )
         self.blocks = nn.Sequential(*[LowFrequencyBlock(channels) for _ in range(num_blocks)])
-        self.transmission_head = nn.Sequential(nn.Conv2d(channels, 1, 3, padding=1), nn.Sigmoid())
-        self.illumination_head = nn.Sequential(nn.Conv2d(channels, 1, 3, padding=1), nn.Sigmoid())
-        self.color_cast_head = nn.Conv2d(channels, 3, 3, padding=1)
 
-    def forward(self, feature: torch.Tensor, dense_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
-        token = self.token_pool(dense_tokens.mean(dim=1))
+    def forward(
+        self,
+        feature: torch.Tensor,
+        dense_tokens: torch.Tensor,
+        prototype_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        token = self.token_pool(dense_tokens.mean(dim=1) + prototype_context)
         x = self.film(feature, token)
         gate = self.channel_gate(token)[:, :, None, None]
         x = x * gate
         dense_feature = self.blocks(x)
-        return {
-            "feature": dense_feature,
-            "transmission": self.transmission_head(dense_feature),
-            "illumination": self.illumination_head(dense_feature),
-            "color_cast": self.color_cast_head(dense_feature),
-        }
+        return {"feature": dense_feature}

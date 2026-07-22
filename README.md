@@ -8,11 +8,13 @@ V1 follows the project documents:
 - Degradation tokenizer
 - Dense degradation expert for dust / sand / haze / low-light / color-cast
 - Sparse occlusion expert for rain / raindrop / snow / local occlusion
+- Dense/sparse compositional prototype bank
 - Simple dense-sparse fusion
 - Restoration decoder
 - V1 losses: reconstruction, SSIM, frequency, color, and degradation classification
 
-V2 modules such as the compositional prototype bank and physics-frequency fusion are intentionally not included here.
+The V1 Word specification includes the compositional prototype bank, so it is
+implemented here. Physics-frequency fusion and real no-GT adaptation remain V2/V3 work.
 
 ## Recommended Hardware and Environment
 
@@ -55,7 +57,12 @@ The default settings are stored in `configs/train_v1_minimal.yaml`:
 | Checkpoint | Every 100 iterations | Best validated state in each 100-iteration window |
 | Early stopping | 15,000 iterations | Stops if validation PSNR does not improve |
 
-The model contains about 8.79 million parameters. Batch size 16 is a safe starting point, not a guaranteed maximum: image dimensions, decoder activations, driver versions, and other GPU processes affect memory usage. Increase the batch size only after observing a stable run. Keep the learning rate at `2e-4` initially even if the batch size is changed.
+The corrected NAFNet-style V1 model contains about 10.06 million parameters.
+Batch size 16 is the single-RTX-5090 physical/effective batch, with no gradient
+accumulation. It is a safe starting point, not a guaranteed maximum: image
+dimensions, decoder activations, driver versions, and other GPU processes affect
+memory usage. Increase the batch size only after observing a stable run. Keep the
+learning rate at `2e-4` initially even if the batch size is changed.
 
 ## Quick Smoke Test
 

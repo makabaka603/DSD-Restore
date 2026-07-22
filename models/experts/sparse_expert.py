@@ -48,8 +48,13 @@ class SparseOcclusionExpert(nn.Module):
         self.edge_attention = nn.Sequential(nn.Conv2d(channels, 1, 3, padding=1), nn.Sigmoid())
         self.blocks = nn.Sequential(*[HighFrequencyBlock(channels) for _ in range(num_blocks)])
 
-    def forward(self, feature: torch.Tensor, sparse_tokens: torch.Tensor) -> dict[str, torch.Tensor]:
-        token = sparse_tokens.mean(dim=1)
+    def forward(
+        self,
+        feature: torch.Tensor,
+        sparse_tokens: torch.Tensor,
+        prototype_context: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        token = sparse_tokens.mean(dim=1) + prototype_context
         gate = self.token_gate(token)[:, :, None, None]
         x = feature * gate
         mask = self.mask_predictor(x)

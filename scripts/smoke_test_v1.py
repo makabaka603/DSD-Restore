@@ -20,10 +20,23 @@ def main() -> None:
     outputs = model(batch["input"])
     loss = DSDRestoreV1Loss()(outputs, batch)
     loss["total"].backward()
+    missing_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    if missing_gradients:
+        raise RuntimeError(f"Trainable parameters without gradients: {missing_gradients}")
+    if outputs["dense_prototype_weights"].shape != (2, 5):
+        raise ValueError("Unexpected dense prototype weight shape")
+    if outputs["sparse_prototype_weights"].shape != (2, 4):
+        raise ValueError("Unexpected sparse prototype weight shape")
     print("DSD-Restore V1 smoke test passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")
     print(f"dense_tokens: {tuple(outputs['dense_tokens'].shape)}")
     print(f"sparse_tokens: {tuple(outputs['sparse_tokens'].shape)}")
+    print(f"prototype loss: {float(loss['proto']):.4f}")
+    print(f"sparse-mask loss: {float(loss['sparse']):.4f}")
     print(f"loss: {float(loss['total'].detach()):.4f}")
 
 

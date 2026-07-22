@@ -31,6 +31,45 @@ def color_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return F.l1_loss(pred_mean, target_mean) + 0.5 * F.l1_loss(pred_std, target_std)
 
 
+def _prototype_diversity(prototypes: torch.Tensor) -> torch.Tensor:
+    normalized = F.normalize(prototypes, dim=-1)
+    similarity = normalized @ normalized.transpose(0, 1)
+    identity = torch.eye(similarity.shape[0], device=similarity.device, dtype=similarity.dtype)
+    return ((similarity - identity) ** 2).mean()
+
+
+def _composition_loss(weights: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    active = labels.sum(dim=1) > 0
+    if not bool(active.any()):
+        return weights.new_zeros(())
+    target = labels[active] / labels[active].sum(dim=1, keepdim=True).clamp_min(1e-6)
+    return F.kl_div(weights[active].clamp_min(1e-6).log(), target, reduction="batchmean")
+
+
+def prototype_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    diversity = _prototype_diversity(outputs["dense_prototypes"])
+    diversity = diversity + _prototype_diversity(outputs["sparse_prototypes"])
+    composition = _composition_loss(outputs["dense_prototype_weights"], batch["dense_label"])
+    composition = composition + _composition_loss(
+        outputs["sparse_prototype_weights"], batch["sparse_label"]
+    )
+    return diversity + 0.5 * composition
+
+
+def sparse_mask_loss(mask: torch.Tensor, sparse_label: torch.Tensor) -> torch.Tensor:
+    """Encourage sparse, non-empty masks only when an occlusion label is present."""
+    has_sparse = sparse_label.amax(dim=1)
+    mask_flat = mask.flatten(1)
+    presence = mask_flat.amax(dim=1).clamp(1e-6, 1.0 - 1e-6)
+    presence_loss = F.binary_cross_entropy(presence, has_sparse)
+    mean_coverage = mask_flat.mean(dim=1)
+    coverage_loss = ((1.0 - has_sparse) * mean_coverage).mean()
+    coverage_loss = coverage_loss + 0.05 * (has_sparse * mean_coverage).mean()
+    tv_h = torch.abs(mask[:, :, 1:, :] - mask[:, :, :-1, :]).mean()
+    tv_w = torch.abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]).mean()
+    return presence_loss + coverage_loss + 0.1 * (tv_h + tv_w)
+
+
 class DSDRestoreV1Loss(nn.Module):
     def __init__(
         self,
@@ -39,6 +78,8 @@ class DSDRestoreV1Loss(nn.Module):
         lambda_freq: float = 0.05,
         lambda_color: float = 0.05,
         lambda_cls: float = 0.05,
+        lambda_proto: float = 0.02,
+        lambda_sparse: float = 0.01,
     ):
         super().__init__()
         self.lambda_rec = lambda_rec
@@ -46,6 +87,8 @@ class DSDRestoreV1Loss(nn.Module):
         self.lambda_freq = lambda_freq
         self.lambda_color = lambda_color
         self.lambda_cls = lambda_cls
+        self.lambda_proto = lambda_proto
+        self.lambda_sparse = lambda_sparse
 
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         pred = outputs["restored"]
@@ -58,12 +101,16 @@ class DSDRestoreV1Loss(nn.Module):
         color = color_loss(pred, target)
         cls = F.binary_cross_entropy_with_logits(outputs["dense_logits"], dense_label)
         cls = cls + F.binary_cross_entropy_with_logits(outputs["sparse_logits"], sparse_label)
+        proto = prototype_loss(outputs, batch)
+        sparse = sparse_mask_loss(outputs["sparse_mask"], sparse_label)
         total = (
             self.lambda_rec * rec
             + self.lambda_ssim * ssim
             + self.lambda_freq * freq
             + self.lambda_color * color
             + self.lambda_cls * cls
+            + self.lambda_proto * proto
+            + self.lambda_sparse * sparse
         )
         return {
             "total": total,
@@ -72,4 +119,6 @@ class DSDRestoreV1Loss(nn.Module):
             "freq": freq.detach(),
             "color": color.detach(),
             "cls": cls.detach(),
+            "proto": proto.detach(),
+            "sparse": sparse.detach(),
         }

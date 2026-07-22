@@ -4,12 +4,15 @@ experiment:
   seed: 42
 
 model:
+  # Formal V1 uses a compact NAFNet-style encoder/decoder sized for one RTX 5090.
+  backbone_type: nafnet
   in_channels: 3
   out_channels: 3
   base_channels: 32
   token_dim: 64
   num_dense_tokens: 5
   num_sparse_tokens: 4
+  prototype_temperature: 0.2
 
 data:
   crop_size: 256
@@ -107,7 +110,8 @@ data:
       task: colorcast
       max_samples: 10
 
-  # RTX 5090 (32 GB) baseline. Reduce to 8 if the real data pipeline runs OOM.
+  # RTX 5090 (32 GB) baseline. This is the physical and effective batch size;
+  # gradient accumulation is intentionally 1. Reduce to 8 only after a real OOM.
   batch_size: 16
   num_workers: 8
   persistent_workers: true
@@ -129,6 +133,8 @@ loss:
   lambda_freq: 0.05
   lambda_color: 0.05
   lambda_cls: 0.05
+  lambda_proto: 0.02
+  lambda_sparse: 0.01
 
 runtime:
   device: auto
