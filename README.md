@@ -161,8 +161,20 @@ once experiments begin.
 Evaluate a generated copy with per-combination metrics:
 
 ```bash
-python test.py --config configs/train_v1_stage3.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth --test-input-dir datasets/Synthetic-Mixed-Test-1K/input --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json
+python test.py \
+  --config configs/train_v1_stage3.yaml \
+  --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth \
+  --test-input-dir datasets/Synthetic-Mixed-Test-1K/input \
+  --test-gt-dir datasets/Synthetic-Mixed-Test-1K/gt \
+  --test-metadata datasets/Synthetic-Mixed-Test-1K/metadata.json \
+  --output-csv results/stage3_mixed_test_1k_per_image.csv
 ```
+
+The terminal output reports both the degraded-input baseline and restored
+metrics for every task. The optional CSV contains one row per image with input
+and restored PSNR/SSIM/LPIPS/DISTS. `psnr_gain` and `ssim_gain` are restored
+minus input; `lpips_reduction` and `dists_reduction` are input minus restored,
+so positive values always indicate an improvement.
 
 Before a formal run, audit paths, train/validation leakage, sampling ratios, and
 every paired image size:
