@@ -1,0 +1,21 @@
+base_config:
+  - train_v1_stage3.yaml
+  - naf_baseline_common.yaml
+
+stage:
+  name: naf52_stage3
+  objective: composite_degradation_finetuning
+  init_from_stage: naf52_stage2
+
+experiment:
+  name: naf52_stage3
+  output_dir: experiments/naf52_stage3
+
+model:
+  base_channels: 52
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/naf52_stage3
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/naf52_stage2/best.pth
+  tensorboard:
+    run_name: naf52_stage3

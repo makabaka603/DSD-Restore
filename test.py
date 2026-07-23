@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 
 from datasets import PairedRestorationDataset, build_source_dataset
 from metrics import PerceptualMetrics, batch_psnr, batch_ssim
-from models import DSDRestoreV1
+from models import build_model
 from utils.config import load_config
 from utils.runtime import configure_cuda, get_amp_settings, get_device, move_batch_to_device
 
@@ -123,7 +123,7 @@ def main() -> None:
             training=False,
         )
     loader = DataLoader(dataset, batch_size=1, shuffle=False)
-    model = DSDRestoreV1(**cfg["model"]).to(device)
+    model = build_model(cfg["model"]).to(device)
     checkpoint = torch.load(args.checkpoint, map_location=device)
     model.load_state_dict(checkpoint["model"])
     model.eval()

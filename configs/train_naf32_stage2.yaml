@@ -1,0 +1,21 @@
+base_config:
+  - train_v1_stage2.yaml
+  - naf_baseline_common.yaml
+
+stage:
+  name: naf32_stage2
+  objective: joint_training
+  init_from_stage: naf32_stage1
+
+experiment:
+  name: naf32_stage2
+  output_dir: experiments/naf32_stage2
+
+model:
+  base_channels: 32
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/naf32_stage2
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/naf32_stage1/best.pth
+  tensorboard:
+    run_name: naf32_stage2

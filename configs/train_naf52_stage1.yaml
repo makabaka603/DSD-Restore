@@ -1,0 +1,21 @@
+base_config:
+  - train_v1_stage1.yaml
+  - naf_baseline_common.yaml
+
+stage:
+  name: naf52_stage1
+  objective: single_degradation_pretraining
+  init_from_stage: null
+
+experiment:
+  name: naf52_stage1
+  output_dir: experiments/naf52_stage1
+
+model:
+  base_channels: 52
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/naf52_stage1
+  init_checkpoint: null
+  tensorboard:
+    run_name: naf52_stage1

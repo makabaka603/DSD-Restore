@@ -24,7 +24,7 @@ from metrics import (
     model_diagnostics,
     restoration_panel,
 )
-from models import DSDRestoreV1
+from models import build_model
 from utils.config import load_config
 from utils.runtime import (
     configure_cuda,
@@ -560,7 +560,10 @@ def train(
     initial_path = None if resume_path else configured_init
 
     channels_last_enabled = cfg["runtime"].get("channels_last", False) and device.type == "cuda"
-    model = DSDRestoreV1(**cfg["model"])
+    model = build_model(cfg["model"])
+    supports_dsd_diagnostics = bool(
+        getattr(model, "supports_dsd_diagnostics", False)
+    )
     if initial_path:
         source_stage = load_initial_model_weights(model, initial_path, cfg)
         print(
@@ -741,7 +744,8 @@ def train(
                 if scaler.is_enabled():
                     scaler.unscale_(optim)
                 with torch.no_grad():
-                    diagnostics = model_diagnostics(outputs, batch)
+                    if supports_dsd_diagnostics:
+                        diagnostics.update(model_diagnostics(outputs, batch))
                     diagnostics["system/gradient_global_norm"] = gradient_global_norm(model)
                     diagnostics["system/amp_scale"] = torch.tensor(
                         float(scaler.get_scale()), device=device
@@ -764,7 +768,7 @@ def train(
                 train_end.record()
             global_step += 1
             restored = outputs["restored"].detach()
-            if global_step % histogram_every == 0:
+            if supports_dsd_diagnostics and global_step % histogram_every == 0:
                 write_prototype_histograms(writer, outputs, global_step)
             if diagnostic_step and device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(device)
@@ -834,10 +838,11 @@ def train(
                     perceptual_max_size=val_perceptual_max_size,
                     max_samples_per_source=val_sample_limit,
                     channels_last=channels_last_enabled,
-                    collect_diagnostics=True,
+                    collect_diagnostics=supports_dsd_diagnostics,
                     visual_samples=(
                         image_samples
-                        if global_step % image_every == 0 or global_step == max_iters
+                        if supports_dsd_diagnostics
+                        and (global_step % image_every == 0 or global_step == max_iters)
                         else 0
                     ),
                 )

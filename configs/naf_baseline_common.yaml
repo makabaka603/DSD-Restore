@@ -1,0 +1,13 @@
+model:
+  type: nafnet_baseline
+  in_channels: 3
+  out_channels: 3
+
+loss:
+  lambda_rec: 1.0
+  lambda_ssim: 0.2
+  lambda_freq: 0.05
+  lambda_color: 0.05
+  lambda_cls: 0.0
+  lambda_proto: 0.0
+  lambda_sparse: 0.0

@@ -21,6 +21,8 @@ class DSDRestoreV1(nn.Module):
     -> Simple Fusion -> Decoder D -> restored image.
     """
 
+    supports_dsd_diagnostics = True
+
     def __init__(
         self,
         in_channels: int = 3,

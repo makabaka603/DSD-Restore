@@ -120,16 +120,26 @@ class DSDRestoreV1Loss(nn.Module):
     def forward(self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         pred = outputs["restored"]
         target = batch["gt"]
-        dense_label = batch["dense_label"]
-        sparse_label = batch["sparse_label"]
         rec = F.l1_loss(pred, target)
         ssim = ssim_loss(pred, target)
         freq = frequency_loss(pred, target)
         color = color_loss(pred, target)
-        cls = F.binary_cross_entropy_with_logits(outputs["dense_logits"], dense_label)
-        cls = cls + F.binary_cross_entropy_with_logits(outputs["sparse_logits"], sparse_label)
-        proto = prototype_loss(outputs, batch)
-        sparse = sparse_mask_loss(outputs["sparse_mask"], sparse_label)
+        zero = pred.new_zeros(())
+        if self.lambda_cls > 0:
+            dense_label = batch["dense_label"]
+            sparse_label = batch["sparse_label"]
+            cls = F.binary_cross_entropy_with_logits(outputs["dense_logits"], dense_label)
+            cls = cls + F.binary_cross_entropy_with_logits(
+                outputs["sparse_logits"], sparse_label
+            )
+        else:
+            cls = zero
+        proto = prototype_loss(outputs, batch) if self.lambda_proto > 0 else zero
+        sparse = (
+            sparse_mask_loss(outputs["sparse_mask"], batch["sparse_label"])
+            if self.lambda_sparse > 0
+            else zero
+        )
         total = (
             self.lambda_rec * rec
             + self.lambda_ssim * ssim
