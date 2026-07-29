@@ -2,6 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from .dense_expert import pool_tokens
+
 
 class HighFrequencyBlock(nn.Module):
     def __init__(self, channels: int):
@@ -26,8 +28,18 @@ class HighFrequencyBlock(nn.Module):
 class SparseOcclusionExpert(nn.Module):
     """Sparse expert for rain, raindrop, snow, and local occlusion."""
 
-    def __init__(self, channels: int, token_dim: int, num_blocks: int = 4):
+    def __init__(
+        self,
+        channels: int,
+        token_dim: int,
+        num_blocks: int = 4,
+        token_pooling: str = "mean",
+    ):
         super().__init__()
+        token_pooling = token_pooling.lower()
+        if token_pooling not in {"mean", "presence_weighted"}:
+            raise ValueError("token_pooling must be 'mean' or 'presence_weighted'")
+        self.token_pooling = token_pooling
         self.token_gate = nn.Sequential(
             nn.LayerNorm(token_dim),
             nn.Linear(token_dim, channels),
@@ -52,9 +64,13 @@ class SparseOcclusionExpert(nn.Module):
         self,
         feature: torch.Tensor,
         sparse_tokens: torch.Tensor,
+        sparse_logits: torch.Tensor,
         prototype_context: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        token = sparse_tokens.mean(dim=1) + prototype_context
+        token = (
+            pool_tokens(sparse_tokens, sparse_logits, self.token_pooling)
+            + prototype_context
+        )
         gate = self.token_gate(token)[:, :, None, None]
         x = feature * gate
         mask = self.mask_predictor(x)

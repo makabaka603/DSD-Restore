@@ -1,0 +1,19 @@
+base_config:
+  - train_v1_stage1.yaml
+  - v11_common.yaml
+
+stage:
+  name: v11_stage1
+  objective: single_degradation_pretraining
+  init_from_stage: null
+
+experiment:
+  name: v11_stage1_single
+  output_dir: experiments/v11_stage1_single
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v11_stage1_single
+  init_checkpoint: null
+  init_strict: true
+  tensorboard:
+    run_name: v11_stage1_single

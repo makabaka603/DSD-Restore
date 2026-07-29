@@ -225,6 +225,11 @@ def validate(
     source_counts: dict[str, int] = {}
     diagnostic_sums: dict[str, float] = {}
     diagnostic_counts: dict[str, int] = {}
+    gate_moments = {
+        "fusion_alpha": [0.0, 0.0, 0],
+        "dense_gate": [0.0, 0.0, 0],
+        "sparse_gate": [0.0, 0.0, 0],
+    }
     tokenizer_stats = MultilabelAccumulator()
     for batch in loader:
         task = batch.get("task", ["mixed"])[0]
@@ -239,6 +244,20 @@ def validate(
         if collect_diagnostics:
             diagnostics = model_diagnostics(outputs, batch, include_tokenizer=False)
             tokenizer_stats.update(outputs, batch)
+            gate_outputs = {
+                "fusion_alpha": outputs["fusion_alpha"],
+                "dense_gate": outputs.get(
+                    "fusion_dense_gate", outputs["fusion_alpha"]
+                ),
+                "sparse_gate": outputs.get(
+                    "fusion_sparse_gate", 1.0 - outputs["fusion_alpha"]
+                ),
+            }
+            for name, gate in gate_outputs.items():
+                values = gate.detach().float().flatten()
+                gate_moments[name][0] += float(values.sum().item())
+                gate_moments[name][1] += float(values.square().sum().item())
+                gate_moments[name][2] += values.numel()
             for name, raw_value in diagnostics.items():
                 value = float(raw_value.item())
                 diagnostic_sums[name] = diagnostic_sums.get(name, 0.0) + value
@@ -288,6 +307,13 @@ def validate(
             name: diagnostic_sums[name] / diagnostic_counts[name]
             for name in diagnostic_sums
         }
+        for name, (total, squared_total, count) in gate_moments.items():
+            if count <= 0:
+                continue
+            mean = total / count
+            variance = max(0.0, squared_total / count - mean * mean)
+            diagnostics[f"routing/{name}_mean"] = mean
+            diagnostics[f"routing/{name}_std"] = math.sqrt(variance)
         diagnostics.update(
             {name: float(value.item()) for name, value in tokenizer_stats.compute().items()}
         )
@@ -457,7 +483,41 @@ def load_initial_model_weights(
         raise ValueError(
             f"Stage {stage_name(config)} must initialize from {expected_stage}, found {found}: {path}"
         )
-    model.load_state_dict(state_dict, strict=True)
+    init_strict = bool(config.get("runtime", {}).get("init_strict", True))
+    if init_strict:
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        model_state = model.state_dict()
+        compatible = {
+            name: value
+            for name, value in state_dict.items()
+            if name in model_state and model_state[name].shape == value.shape
+        }
+        total_numel = sum(value.numel() for value in model_state.values())
+        loaded_numel = sum(model_state[name].numel() for name in compatible)
+        coverage = loaded_numel / max(total_numel, 1)
+        min_coverage = float(
+            config.get("runtime", {}).get("init_min_coverage", 0.95)
+        )
+        if coverage < min_coverage:
+            raise RuntimeError(
+                f"Compatible initialization coverage {coverage:.2%} is below "
+                f"runtime.init_min_coverage={min_coverage:.2%}: {path}"
+            )
+        incompatible = model.load_state_dict(compatible, strict=False)
+        shape_mismatches = sorted(
+            name
+            for name, value in state_dict.items()
+            if name in model_state and model_state[name].shape != value.shape
+        )
+        print(
+            f"Compatible checkpoint initialization loaded {coverage:.2%} of model "
+            f"state by element count; missing={len(incompatible.missing_keys)}, "
+            f"unexpected={len(incompatible.unexpected_keys)}, "
+            f"shape_mismatches={len(shape_mismatches)}."
+        )
+        if shape_mismatches:
+            print(f"  Reinitialized shape-mismatched keys: {shape_mismatches}")
     return source_stage
 
 
@@ -712,6 +772,7 @@ def train(
             if global_step >= max_iters:
                 break
             next_step = global_step + 1
+            criterion.set_training_progress(next_step / max_iters)
             diagnostic_step = next_step % diagnostics_every == 0
             batch = use_channels_last(move_batch_to_device(batch, device), channels_last_enabled)
             train_start = train_end = metric_end = None
@@ -746,6 +807,10 @@ def train(
                 with torch.no_grad():
                     if supports_dsd_diagnostics:
                         diagnostics.update(model_diagnostics(outputs, batch))
+                    diagnostics["loss/auxiliary_scale"] = torch.tensor(
+                        criterion.auxiliary_scale,
+                        device=device,
+                    )
                     diagnostics["system/gradient_global_norm"] = gradient_global_norm(model)
                     diagnostics["system/amp_scale"] = torch.tensor(
                         float(scaler.get_scale()), device=device

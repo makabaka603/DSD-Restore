@@ -1,0 +1,14 @@
+model:
+  # V1.1 changes are explicit so the original V1 configs remain reproducible.
+  fusion_mode: independent
+  token_pooling: presence_weighted
+  prototype_weighting: sigmoid
+
+loss:
+  classification_pos_weight: 2.0
+  prototype_loss_mode: multilabel
+  mask_loss_mode: topk
+  mask_topk_fraction: 0.05
+  mask_min_positive_coverage: 0.02
+  auxiliary_decay_start: 1.0
+  auxiliary_final_scale: 1.0

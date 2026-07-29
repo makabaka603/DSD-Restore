@@ -38,10 +38,23 @@ def multilabel_metrics_from_counts(
     precision = _safe_div(tp, tp + fp)
     recall = _safe_div(tp, tp + fn)
     f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-8)
+    active = (tp + fn) > 0
+    if bool(active.any()):
+        active_precision = precision[active].mean()
+        active_recall = recall[active].mean()
+        active_f1 = f1[active].mean()
+    else:
+        active_precision = precision.new_zeros(())
+        active_recall = recall.new_zeros(())
+        active_f1 = f1.new_zeros(())
     result = {
         f"{prefix}/macro_precision": precision.mean(),
         f"{prefix}/macro_recall": recall.mean(),
         f"{prefix}/macro_f1": f1.mean(),
+        f"{prefix}/active_macro_precision": active_precision,
+        f"{prefix}/active_macro_recall": active_recall,
+        f"{prefix}/active_macro_f1": active_f1,
+        f"{prefix}/active_class_count": active.sum().float(),
     }
     for index, name in enumerate(names):
         result[f"{prefix}/{name}/precision"] = precision[index]
@@ -104,6 +117,18 @@ class MultilabelAccumulator:
             + result["tokenizer/sparse/macro_recall"]
         )
         result["tokenizer/macro_f1"] = 0.5 * (dense_f1 + sparse_f1)
+        result["tokenizer/active_macro_precision"] = 0.5 * (
+            result["tokenizer/dense/active_macro_precision"]
+            + result["tokenizer/sparse/active_macro_precision"]
+        )
+        result["tokenizer/active_macro_recall"] = 0.5 * (
+            result["tokenizer/dense/active_macro_recall"]
+            + result["tokenizer/sparse/active_macro_recall"]
+        )
+        result["tokenizer/active_macro_f1"] = 0.5 * (
+            result["tokenizer/dense/active_macro_f1"]
+            + result["tokenizer/sparse/active_macro_f1"]
+        )
         return result
 
 
@@ -146,6 +171,25 @@ def _feature_high_frequency_energy(feature: torch.Tensor) -> torch.Tensor:
     return (feature - low).square().mean().sqrt()
 
 
+def _prototype_activation_stats(
+    activations: torch.Tensor,
+    names: Sequence[str],
+    family: str,
+) -> dict[str, torch.Tensor]:
+    activations = activations.float()
+    result = {
+        f"prototype/{family}/activation_mean": activations.mean(),
+        f"prototype/{family}/active_count": (
+            activations >= 0.5
+        ).sum(dim=1).float().mean(),
+    }
+    for index, name in enumerate(names):
+        result[
+            f"prototype/{family}/activation/{name}"
+        ] = activations[:, index].mean()
+    return result
+
+
 def _task_names(batch: dict, batch_size: int) -> list[str]:
     raw = batch.get("task", ["mixed"] * batch_size)
     if isinstance(raw, str):
@@ -165,10 +209,20 @@ def model_diagnostics(
     dense_feature = outputs["dense_feature"].float()
     sparse_feature = outputs["sparse_feature"].float()
     mask = outputs["sparse_mask"].float()
-    alpha = outputs["fusion_alpha"].float().flatten()
+    dense_gate = outputs.get(
+        "fusion_dense_gate", outputs["fusion_alpha"]
+    ).float().flatten()
+    sparse_gate = outputs.get(
+        "fusion_sparse_gate", 1.0 - outputs["fusion_alpha"]
+    ).float().flatten()
     result = {
-        "routing/fusion_alpha_mean": alpha.mean(),
-        "routing/fusion_alpha_std": alpha.std(unbiased=False),
+        "routing/fusion_alpha_mean": dense_gate.mean(),
+        "routing/fusion_alpha_std": dense_gate.std(unbiased=False),
+        "routing/dense_gate_mean": dense_gate.mean(),
+        "routing/dense_gate_std": dense_gate.std(unbiased=False),
+        "routing/sparse_gate_mean": sparse_gate.mean(),
+        "routing/sparse_gate_std": sparse_gate.std(unbiased=False),
+        "routing/gate_sum_mean": (dense_gate + sparse_gate).mean(),
         "expert/dense_feature_norm": dense_feature.square().mean().sqrt(),
         "expert/sparse_feature_norm": sparse_feature.square().mean().sqrt(),
         "expert/dense_high_frequency_energy": _feature_high_frequency_energy(dense_feature),
@@ -180,13 +234,21 @@ def model_diagnostics(
             + torch.abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]).mean()
         ),
     }
-    tasks = _task_names(batch, alpha.numel())
+    tasks = _task_names(batch, dense_gate.numel())
     for task in sorted(set(tasks)):
         indices = torch.tensor(
             [index for index, name in enumerate(tasks) if name == task],
-            device=alpha.device,
+            device=dense_gate.device,
         )
-        result[f"routing/fusion_alpha_by_task/{task}"] = alpha[indices].mean()
+        result[
+            f"routing/fusion_alpha_by_task/{task}"
+        ] = dense_gate[indices].mean()
+        result[
+            f"routing/dense_gate_by_task/{task}"
+        ] = dense_gate[indices].mean()
+        result[
+            f"routing/sparse_gate_by_task/{task}"
+        ] = sparse_gate[indices].mean()
         result[f"mask/coverage_by_task/{task}"] = mask[indices].mean()
 
     result.update(
@@ -197,6 +259,22 @@ def model_diagnostics(
             "dense",
         )
     )
+    if "dense_prototype_activations" in outputs:
+        result.update(
+            _prototype_activation_stats(
+                outputs["dense_prototype_activations"],
+                DENSE_NAMES,
+                "dense",
+            )
+        )
+    if "sparse_prototype_activations" in outputs:
+        result.update(
+            _prototype_activation_stats(
+                outputs["sparse_prototype_activations"],
+                SPARSE_NAMES,
+                "sparse",
+            )
+        )
     result.update(
         _prototype_stats(
             outputs["sparse_prototype_weights"],
@@ -230,6 +308,18 @@ def model_diagnostics(
         result["tokenizer/macro_f1"] = 0.5 * (
             result["tokenizer/dense/macro_f1"]
             + result["tokenizer/sparse/macro_f1"]
+        )
+        result["tokenizer/active_macro_precision"] = 0.5 * (
+            result["tokenizer/dense/active_macro_precision"]
+            + result["tokenizer/sparse/active_macro_precision"]
+        )
+        result["tokenizer/active_macro_recall"] = 0.5 * (
+            result["tokenizer/dense/active_macro_recall"]
+            + result["tokenizer/sparse/active_macro_recall"]
+        )
+        result["tokenizer/active_macro_f1"] = 0.5 * (
+            result["tokenizer/dense/active_macro_f1"]
+            + result["tokenizer/sparse/active_macro_f1"]
         )
     return {name: value.detach() for name, value in result.items()}
 

@@ -2,6 +2,19 @@ import torch
 from torch import nn
 
 
+def pool_tokens(
+    tokens: torch.Tensor,
+    logits: torch.Tensor,
+    mode: str,
+) -> torch.Tensor:
+    if mode == "mean":
+        return tokens.mean(dim=1)
+    presence = torch.sigmoid(logits).unsqueeze(-1)
+    # clamp_min(1) preserves absolute absence: if every class is unlikely,
+    # the pooled prompt approaches zero instead of amplifying numerical noise.
+    return (tokens * presence).sum(dim=1) / presence.sum(dim=1).clamp_min(1.0)
+
+
 class FiLM(nn.Module):
     def __init__(self, token_dim: int, channels: int):
         super().__init__()
@@ -38,8 +51,18 @@ class LowFrequencyBlock(nn.Module):
 class DenseDegradationExpert(nn.Module):
     """Dense expert for dust, sand, haze, low-light, and color-cast."""
 
-    def __init__(self, channels: int, token_dim: int, num_blocks: int = 4):
+    def __init__(
+        self,
+        channels: int,
+        token_dim: int,
+        num_blocks: int = 4,
+        token_pooling: str = "mean",
+    ):
         super().__init__()
+        token_pooling = token_pooling.lower()
+        if token_pooling not in {"mean", "presence_weighted"}:
+            raise ValueError("token_pooling must be 'mean' or 'presence_weighted'")
+        self.token_pooling = token_pooling
         self.token_pool = nn.Sequential(nn.LayerNorm(token_dim), nn.Linear(token_dim, token_dim), nn.GELU())
         self.film = FiLM(token_dim, channels)
         self.channel_gate = nn.Sequential(
@@ -52,9 +75,13 @@ class DenseDegradationExpert(nn.Module):
         self,
         feature: torch.Tensor,
         dense_tokens: torch.Tensor,
+        dense_logits: torch.Tensor,
         prototype_context: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        token = self.token_pool(dense_tokens.mean(dim=1) + prototype_context)
+        token = self.token_pool(
+            pool_tokens(dense_tokens, dense_logits, self.token_pooling)
+            + prototype_context
+        )
         x = self.film(feature, token)
         gate = self.channel_gate(token)[:, :, None, None]
         x = x * gate

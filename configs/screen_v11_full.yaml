@@ -1,0 +1,21 @@
+base_config: screen_v11_multilabel_proto.yaml
+
+stage:
+  name: v11_screen_a5_full
+
+experiment:
+  name: v11_screen_a5_full
+  output_dir: experiments/v11_screen_a5_full
+
+loss:
+  classification_pos_weight: 2.0
+  mask_loss_mode: topk
+  mask_topk_fraction: 0.05
+  mask_min_positive_coverage: 0.02
+  auxiliary_decay_start: 0.25
+  auxiliary_final_scale: 0.25
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v11_screen_a5_full
+  tensorboard:
+    run_name: v11_screen_a5_full

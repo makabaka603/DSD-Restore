@@ -1,4 +1,5 @@
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -8,7 +9,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from losses import DSDRestoreV1Loss
 from losses.v1_losses import sparse_mask_loss
 from metrics import gradient_global_norm, model_diagnostics, restoration_panel
+from metrics.training_diagnostics import multilabel_metrics_from_counts
 from models import DSDRestoreV1
+from models.experts.dense_expert import pool_tokens
+from train import load_initial_model_weights
+from utils.config import load_config
 
 
 def check_sparse_mask_amp() -> None:
@@ -32,8 +37,184 @@ def check_sparse_mask_amp() -> None:
         raise RuntimeError("Sparse-mask AMP loss or gradients are not finite")
 
 
+def check_v11_mask_loss() -> None:
+    sparse_label = torch.tensor([[1, 0, 0, 0]], dtype=torch.float32)
+    collapsed = torch.full((1, 1, 10, 10), 0.001, requires_grad=True)
+    collapsed.data[:, :, 0, 0] = 0.99
+    distributed = torch.full((1, 1, 10, 10), 0.001, requires_grad=True)
+    distributed.data[:, :, 0, :5] = 0.90
+    collapsed_loss = sparse_mask_loss(
+        collapsed,
+        sparse_label,
+        mode="topk",
+        topk_fraction=0.05,
+        min_positive_coverage=0.02,
+    )
+    distributed_loss = sparse_mask_loss(
+        distributed,
+        sparse_label,
+        mode="topk",
+        topk_fraction=0.05,
+        min_positive_coverage=0.02,
+    )
+    if not distributed_loss < collapsed_loss:
+        raise RuntimeError(
+            "V1.1 mask loss must penalize a one-hot positive mask more than "
+            "a distributed top-k response"
+        )
+    (collapsed_loss + distributed_loss).backward()
+
+
+def check_active_macro_metrics() -> None:
+    metrics = multilabel_metrics_from_counts(
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([0.0, 0.0]),
+        torch.tensor([0.0, 0.0]),
+        ("present", "absent"),
+        "check",
+    )
+    if not torch.isclose(metrics["check/macro_f1"], torch.tensor(0.5)):
+        raise RuntimeError("Legacy macro F1 changed unexpectedly")
+    if not torch.isclose(metrics["check/active_macro_f1"], torch.tensor(1.0)):
+        raise RuntimeError("Active-label macro F1 must exclude absent classes")
+
+
+def check_v11_checkpoint_compatibility() -> None:
+    legacy = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+    )
+    v11 = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+        fusion_mode="independent",
+        token_pooling="presence_weighted",
+        prototype_weighting="sigmoid",
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint_path = Path(directory) / "legacy_stage2.pth"
+        torch.save(
+            {
+                "model": legacy.state_dict(),
+                "config": {"stage": {"name": "stage2"}},
+            },
+            checkpoint_path,
+        )
+        load_initial_model_weights(
+            v11,
+            checkpoint_path,
+            {
+                "stage": {
+                    "name": "v11_screen",
+                    "init_from_stage": "stage2",
+                },
+                "runtime": {
+                    "init_strict": False,
+                    "init_min_coverage": 0.95,
+                },
+            },
+        )
+
+
+def check_v11_forward_backward() -> None:
+    model = DSDRestoreV1(
+        base_channels=16,
+        token_dim=32,
+        fusion_mode="independent",
+        token_pooling="presence_weighted",
+        prototype_weighting="sigmoid",
+    )
+    batch = {
+        "input": torch.rand(2, 3, 64, 64),
+        "gt": torch.rand(2, 3, 64, 64),
+        "dense_label": torch.tensor(
+            [[1, 0, 1, 0, 0], [0, 1, 0, 1, 0]],
+            dtype=torch.float32,
+        ),
+        "sparse_label": torch.tensor(
+            [[1, 0, 0, 0], [0, 0, 1, 0]],
+            dtype=torch.float32,
+        ),
+    }
+    outputs = model(batch["input"])
+    criterion = DSDRestoreV1Loss(
+        classification_pos_weight=2.0,
+        prototype_loss_mode="multilabel",
+        mask_loss_mode="topk",
+        auxiliary_decay_start=0.25,
+        auxiliary_final_scale=0.25,
+    )
+    criterion.set_training_progress(1.0)
+    if abs(criterion.auxiliary_scale - 0.25) > 1e-8:
+        raise RuntimeError("V1.1 auxiliary-loss decay did not reach its final scale")
+    losses = criterion(outputs, batch)
+    losses["total"].backward()
+    diagnostics = model_diagnostics(outputs, batch)
+    missing_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    if missing_gradients:
+        raise RuntimeError(
+            f"V1.1 trainable parameters without gradients: {missing_gradients}"
+        )
+    if outputs["fusion_dense_gate"].shape != (2, 1, 1, 1):
+        raise RuntimeError("Unexpected V1.1 dense-gate shape")
+    if outputs["fusion_sparse_gate"].shape != (2, 1, 1, 1):
+        raise RuntimeError("Unexpected V1.1 sparse-gate shape")
+    if outputs["dense_prototype_activations"].shape != (2, 5):
+        raise RuntimeError("Unexpected V1.1 dense prototype activation shape")
+    required_diagnostics = {
+        "routing/dense_gate_mean",
+        "routing/sparse_gate_mean",
+        "routing/gate_sum_mean",
+        "prototype/dense/active_count",
+        "tokenizer/active_macro_recall",
+    }
+    missing_diagnostics = required_diagnostics - diagnostics.keys()
+    if missing_diagnostics:
+        raise RuntimeError(
+            f"Missing V1.1 diagnostics: {sorted(missing_diagnostics)}"
+        )
+    absent_logits = torch.full((2, 5), -20.0)
+    absent_pool = pool_tokens(
+        torch.ones(2, 5, 4),
+        absent_logits,
+        "presence_weighted",
+    )
+    if float(absent_pool.abs().max()) >= 1e-6:
+        raise RuntimeError("Absent V1.1 token family must approach a zero prompt")
+
+
+def check_v11_configs() -> None:
+    config_paths = [
+        "configs/screen_v11_control.yaml",
+        "configs/screen_v11_aux_off.yaml",
+        "configs/screen_v11_dual_gate.yaml",
+        "configs/screen_v11_weighted_tokens.yaml",
+        "configs/screen_v11_multilabel_proto.yaml",
+        "configs/screen_v11_full.yaml",
+        "configs/smoke_v11.yaml",
+        "configs/train_v11_stage1.yaml",
+        "configs/train_v11_stage2.yaml",
+        "configs/train_v11_stage3.yaml",
+    ]
+    for config_path in config_paths:
+        config = load_config(config_path)
+        if "model" not in config or "loss" not in config:
+            raise RuntimeError(f"Incomplete V1.1 config: {config_path}")
+
+
 def main() -> None:
     check_sparse_mask_amp()
+    check_v11_mask_loss()
+    check_active_macro_metrics()
+    check_v11_checkpoint_compatibility()
+    check_v11_forward_backward()
+    check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
     batch = {
         "input": torch.rand(2, 3, 64, 64),
@@ -73,6 +254,9 @@ def main() -> None:
     if panel.shape != (3, 128, 384):
         raise ValueError(f"Unexpected TensorBoard panel shape: {tuple(panel.shape)}")
     print("DSD-Restore V1 smoke test passed")
+    print("DSD-Restore V1.1 smoke test passed")
+    print("V1.1 compatible checkpoint initialization: passed")
+    print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")
     print(f"dense_tokens: {tuple(outputs['dense_tokens'].shape)}")

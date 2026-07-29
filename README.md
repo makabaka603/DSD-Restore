@@ -71,6 +71,18 @@ learning rate at `2e-4` initially even if the batch size is changed.
 python scripts/smoke_test_v1.py
 ```
 
+## V1.1 Controlled Repair Experiments
+
+V1.1 keeps every original V1 config backward compatible and adds opt-in fixes
+for independent expert gates, presence-weighted tokens, multi-label prototypes,
+non-collapsing weak mask supervision, positive-weighted classification and
+late auxiliary-loss decay.
+
+Do not select these changes on the frozen test set. Run the six short validation
+screens first, then train the selected candidate from Stage 1. The complete
+command sequence and TensorBoard decision criteria are in
+[`docs/V11_RUNBOOK.md`](docs/V11_RUNBOOK.md).
+
 ## Data
 
 The default configuration reads each dataset in place. Do not copy everything
