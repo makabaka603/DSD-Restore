@@ -313,6 +313,17 @@ zero. The trainer checks stage labels to prevent mixing these two operations.
 python test.py --config configs/train_v1_stage3.yaml --checkpoint /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage3_composite/best.pth
 ```
 
+## V2-lite C1 Multiscale Screen
+
+The validation-only C1 experiment adds zero-initialized dense/sparse adapters
+at `f2`, `f3` and `f4` while preserving the old V1 function at initialization.
+See `docs/V2LITE_C1_RUNBOOK.md` before running:
+
+```bash
+python scripts/smoke_test_v1.py
+python train.py --config configs/screen_v2lite_c1_multiscale.yaml
+```
+
 ## Inference
 
 ```bash

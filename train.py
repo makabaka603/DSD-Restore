@@ -588,6 +588,26 @@ def load_initial_model_weights(
                 f"runtime.init_min_coverage={min_coverage:.2%}: {path}"
             )
         incompatible = model.load_state_dict(compatible, strict=False)
+        allowed_missing_prefixes = tuple(
+            str(prefix)
+            for prefix in config.get("runtime", {}).get(
+                "init_allowed_missing_prefixes",
+                (),
+            )
+        )
+        disallowed_missing = [
+            name
+            for name in incompatible.missing_keys
+            if not any(
+                name.startswith(prefix)
+                for prefix in allowed_missing_prefixes
+            )
+        ]
+        if disallowed_missing:
+            raise RuntimeError(
+                "Compatible initialization left unexpected model parameters "
+                f"uninitialized: {disallowed_missing}"
+            )
         shape_mismatches = sorted(
             name
             for name, value in state_dict.items()

@@ -1,0 +1,27 @@
+base_config: screen_v11_aux_off.yaml
+
+stage:
+  name: v2lite_screen_c1_multiscale
+  objective: short_validation_screen
+  init_from_stage: stage2
+
+experiment:
+  name: v2lite_screen_c1_multiscale
+  output_dir: experiments/v2lite_screen_c1_multiscale
+
+model:
+  # Keep the V1 backbone, tokenizer, prototypes, experts and complementary
+  # fusion unchanged. Only f2/f3/f4 receive identity-initialized adapters.
+  multiscale_conditioning: true
+  multiscale_levels: [1, 2, 3]
+  multiscale_reduction: 4
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/v2lite_screen_c1_multiscale
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage2_joint/best.pth
+  init_strict: false
+  init_min_coverage: 0.98
+  init_allowed_missing_prefixes:
+    - multiscale_conditioner.
+  tensorboard:
+    run_name: v2lite_screen_c1_multiscale

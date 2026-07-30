@@ -234,6 +234,32 @@ def model_diagnostics(
             + torch.abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]).mean()
         ),
     }
+    for level_name in ("f1", "f2", "f3", "f4"):
+        residual_key = f"multiscale_residual_{level_name}"
+        if residual_key not in outputs:
+            continue
+        residual = outputs[residual_key].float()
+        dense_scale_gate = outputs[
+            f"multiscale_dense_gate_{level_name}"
+        ].float()
+        sparse_scale_gate = outputs[
+            f"multiscale_sparse_gate_{level_name}"
+        ].float()
+        result[f"multiscale/{level_name}/residual_rms"] = (
+            residual.square().mean().sqrt()
+        )
+        result[f"multiscale/{level_name}/dense_gate_mean"] = (
+            dense_scale_gate.mean()
+        )
+        result[f"multiscale/{level_name}/dense_gate_std"] = (
+            dense_scale_gate.std(unbiased=False)
+        )
+        result[f"multiscale/{level_name}/sparse_gate_mean"] = (
+            sparse_scale_gate.mean()
+        )
+        result[f"multiscale/{level_name}/sparse_gate_std"] = (
+            sparse_scale_gate.std(unbiased=False)
+        )
     tasks = _task_names(batch, dense_gate.numel())
     for task in sorted(set(tasks)):
         indices = torch.tensor(

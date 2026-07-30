@@ -149,6 +149,136 @@ def check_v11_checkpoint_compatibility() -> None:
     )
 
 
+def check_v2lite_multiscale_identity_and_gradients() -> None:
+    torch.manual_seed(23)
+    legacy = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="nafnet",
+    )
+    c1 = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="nafnet",
+        multiscale_conditioning=True,
+        multiscale_levels=(1, 2, 3),
+        multiscale_reduction=4,
+    )
+    legacy.eval()
+    c1.eval()
+    image = torch.rand(1, 3, 64, 64)
+    with torch.no_grad():
+        legacy_outputs = legacy(image)
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint_path = Path(directory) / "legacy_stage2.pth"
+        torch.save(
+            {
+                "model": legacy.state_dict(),
+                "config": {"stage": {"name": "stage2"}},
+            },
+            checkpoint_path,
+        )
+        load_initial_model_weights(
+            c1,
+            checkpoint_path,
+            {
+                "stage": {
+                    "name": "v2lite_screen_c1_multiscale",
+                    "init_from_stage": "stage2",
+                },
+                "runtime": {
+                    "init_strict": False,
+                    "init_min_coverage": 0.95,
+                    "init_allowed_missing_prefixes": [
+                        "multiscale_conditioner.",
+                    ],
+                },
+            },
+        )
+    with torch.no_grad():
+        c1_outputs = c1(image)
+    torch.testing.assert_close(
+        c1_outputs["restored"],
+        legacy_outputs["restored"],
+        rtol=1e-5,
+        atol=1e-6,
+        msg="Zero-initialized multiscale adapters changed the V1 output",
+    )
+    for level_name in ("f2", "f3", "f4"):
+        residual = c1_outputs[f"multiscale_residual_{level_name}"]
+        torch.testing.assert_close(
+            residual,
+            torch.zeros_like(residual),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    c1.train()
+    c1.zero_grad(set_to_none=True)
+    train_outputs = c1(image)
+    train_outputs["restored"].square().mean().backward()
+    adapter_parameters = {
+        name: parameter
+        for name, parameter in c1.named_parameters()
+        if name.startswith("multiscale_conditioner.")
+    }
+    missing_gradients = [
+        name
+        for name, parameter in adapter_parameters.items()
+        if parameter.grad is None
+    ]
+    if missing_gradients:
+        raise RuntimeError(
+            "V2-lite multiscale parameters without gradients: "
+            f"{missing_gradients}"
+        )
+    expand_gradient = sum(
+        float(parameter.grad.detach().abs().sum())
+        for name, parameter in adapter_parameters.items()
+        if name.endswith("expand.weight")
+    )
+    if expand_gradient <= 0:
+        raise RuntimeError(
+            "V2-lite zero-initialized output projections received no gradient"
+        )
+    diagnostics = model_diagnostics(train_outputs, {
+        "dense_label": torch.zeros(1, 5),
+        "sparse_label": torch.zeros(1, 4),
+        "task": ["smoke"],
+    })
+    required = {
+        f"multiscale/{level_name}/residual_rms"
+        for level_name in ("f2", "f3", "f4")
+    }
+    missing = required - diagnostics.keys()
+    if missing:
+        raise RuntimeError(
+            f"Missing V2-lite multiscale diagnostics: {sorted(missing)}"
+        )
+
+    full_legacy = DSDRestoreV1()
+    full_c1 = DSDRestoreV1(multiscale_conditioning=True)
+    legacy_parameters = sum(
+        parameter.numel()
+        for parameter in full_legacy.parameters()
+    )
+    c1_parameters = sum(
+        parameter.numel()
+        for parameter in full_c1.parameters()
+    )
+    overhead = c1_parameters - legacy_parameters
+    if overhead > 250_000:
+        raise RuntimeError(
+            f"V2-lite C1 overhead is too large: {overhead:,} parameters"
+        )
+    coverage = legacy_parameters / c1_parameters
+    if coverage < 0.98:
+        raise RuntimeError(
+            "V2-lite C1 old-parameter coverage is below 98%: "
+            f"{coverage:.2%}"
+        )
+
+
 def check_v11_forward_backward() -> None:
     model = DSDRestoreV1(
         base_channels=16,
@@ -230,6 +360,7 @@ def check_v11_configs() -> None:
         "configs/screen_v11_full.yaml",
         "configs/screen_v11b_dual_gate_migrated.yaml",
         "configs/screen_v11b_full_migrated.yaml",
+        "configs/screen_v2lite_c1_multiscale.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -246,6 +377,7 @@ def main() -> None:
     check_v11_mask_loss()
     check_active_macro_metrics()
     check_v11_checkpoint_compatibility()
+    check_v2lite_multiscale_identity_and_gradients()
     check_v11_forward_backward()
     check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
@@ -289,6 +421,7 @@ def main() -> None:
     print("DSD-Restore V1 smoke test passed")
     print("DSD-Restore V1.1 smoke test passed")
     print("V1.1 equivalent legacy-gate checkpoint migration: passed")
+    print("V2-lite C1 identity initialization and gradients: passed")
     print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")

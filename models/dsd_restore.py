@@ -6,7 +6,9 @@ from .backbone import (
     RestorationDecoder,
     SharedEncoder,
 )
+from .conditioning import MultiScaleExpertConditioner
 from .experts import DenseDegradationExpert, SparseOcclusionExpert
+from .experts.dense_expert import pool_tokens
 from .fusion import SimpleDenseSparseFusion
 from .prototype import CompositionalPrototypeBank
 from .tokenizer import DegradationTokenizer
@@ -36,6 +38,9 @@ class DSDRestoreV1(nn.Module):
         fusion_mode: str = "complementary",
         token_pooling: str = "mean",
         prototype_weighting: str = "softmax",
+        multiscale_conditioning: bool = False,
+        multiscale_levels: tuple[int, ...] = (1, 2, 3),
+        multiscale_reduction: int = 4,
     ):
         super().__init__()
         backbone_type = backbone_type.lower()
@@ -62,6 +67,17 @@ class DSDRestoreV1(nn.Module):
             num_sparse_prototypes=num_sparse_tokens,
             temperature=prototype_temperature,
             weighting_mode=prototype_weighting,
+        )
+        self.token_pooling_mode = token_pooling
+        self.multiscale_conditioner = (
+            MultiScaleExpertConditioner(
+                encoder_channels=self.encoder.out_channels,
+                token_dim=token_dim,
+                levels=multiscale_levels,
+                reduction=multiscale_reduction,
+            )
+            if multiscale_conditioning
+            else None
         )
         bottleneck_channels = self.encoder.out_channels[-1]
         self.dense_expert = DenseDegradationExpert(
@@ -90,6 +106,29 @@ class DSDRestoreV1(nn.Module):
             tokens["dense_logits"],
             tokens["sparse_logits"],
         )
+        multiscale_outputs: dict[str, torch.Tensor] = {}
+        if self.multiscale_conditioner is not None:
+            dense_prompt = (
+                pool_tokens(
+                    tokens["dense_tokens"],
+                    tokens["dense_logits"],
+                    self.token_pooling_mode,
+                )
+                + prototypes["dense_context"]
+            )
+            sparse_prompt = (
+                pool_tokens(
+                    tokens["sparse_tokens"],
+                    tokens["sparse_logits"],
+                    self.token_pooling_mode,
+                )
+                + prototypes["sparse_context"]
+            )
+            features, multiscale_outputs = self.multiscale_conditioner(
+                features,
+                dense_prompt,
+                sparse_prompt,
+            )
         dense = self.dense_expert(
             features[-1],
             tokens["dense_tokens"],
@@ -113,7 +152,7 @@ class DSDRestoreV1(nn.Module):
         # Do not clamp during training: saturation would zero the gradient at
         # precisely the over/under-exposed pixels the model must correct.
         restored = image + torch.tanh(restored)
-        return {
+        outputs = {
             "restored": restored,
             "dense_tokens": tokens["dense_tokens"],
             "sparse_tokens": tokens["sparse_tokens"],
@@ -140,3 +179,5 @@ class DSDRestoreV1(nn.Module):
             "dense_prototypes": prototypes["dense_prototypes"],
             "sparse_prototypes": prototypes["sparse_prototypes"],
         }
+        outputs.update(multiscale_outputs)
+        return outputs
