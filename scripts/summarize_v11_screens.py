@@ -12,6 +12,8 @@ SCREEN_RUNS = (
     "v11_screen_a3_weighted_tokens",
     "v11_screen_a4_multilabel_proto",
     "v11_screen_a5_full",
+    "v11b_screen_b1_dual_gate_migrated",
+    "v11b_screen_b2_full_migrated",
 )
 
 

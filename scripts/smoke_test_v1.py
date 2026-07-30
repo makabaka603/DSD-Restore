@@ -80,19 +80,23 @@ def check_active_macro_metrics() -> None:
 
 
 def check_v11_checkpoint_compatibility() -> None:
+    torch.manual_seed(17)
     legacy = DSDRestoreV1(
         base_channels=8,
         token_dim=16,
         backbone_type="simple",
     )
-    v11 = DSDRestoreV1(
+    independent = DSDRestoreV1(
         base_channels=8,
         token_dim=16,
         backbone_type="simple",
         fusion_mode="independent",
-        token_pooling="presence_weighted",
-        prototype_weighting="sigmoid",
     )
+    legacy.eval()
+    independent.eval()
+    image = torch.rand(2, 3, 64, 64)
+    with torch.no_grad():
+        legacy_outputs = legacy(image)
     with tempfile.TemporaryDirectory() as directory:
         checkpoint_path = Path(directory) / "legacy_stage2.pth"
         torch.save(
@@ -103,7 +107,7 @@ def check_v11_checkpoint_compatibility() -> None:
             checkpoint_path,
         )
         load_initial_model_weights(
-            v11,
+            independent,
             checkpoint_path,
             {
                 "stage": {
@@ -116,6 +120,33 @@ def check_v11_checkpoint_compatibility() -> None:
                 },
             },
         )
+    with torch.no_grad():
+        independent_outputs = independent(image)
+    for output_name in (
+        "restored",
+        "fusion_dense_gate",
+        "fusion_sparse_gate",
+    ):
+        torch.testing.assert_close(
+            independent_outputs[output_name],
+            legacy_outputs[output_name],
+            rtol=1e-5,
+            atol=1e-6,
+            msg=(
+                "Legacy-to-independent gate migration changed "
+                f"{output_name} at initialization"
+            ),
+        )
+    gate_sum = (
+        independent_outputs["fusion_dense_gate"]
+        + independent_outputs["fusion_sparse_gate"]
+    )
+    torch.testing.assert_close(
+        gate_sum,
+        torch.ones_like(gate_sum),
+        rtol=0.0,
+        atol=1e-6,
+    )
 
 
 def check_v11_forward_backward() -> None:
@@ -197,6 +228,8 @@ def check_v11_configs() -> None:
         "configs/screen_v11_weighted_tokens.yaml",
         "configs/screen_v11_multilabel_proto.yaml",
         "configs/screen_v11_full.yaml",
+        "configs/screen_v11b_dual_gate_migrated.yaml",
+        "configs/screen_v11b_full_migrated.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -255,7 +288,7 @@ def main() -> None:
         raise ValueError(f"Unexpected TensorBoard panel shape: {tuple(panel.shape)}")
     print("DSD-Restore V1 smoke test passed")
     print("DSD-Restore V1.1 smoke test passed")
-    print("V1.1 compatible checkpoint initialization: passed")
+    print("V1.1 equivalent legacy-gate checkpoint migration: passed")
     print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")

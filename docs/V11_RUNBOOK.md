@@ -53,8 +53,35 @@ All six screens:
 - write to separate checkpoint and TensorBoard directories;
 - never initialize from another screen.
 
-The architecture-changing screens print compatible checkpoint coverage. Stop
-if it is below 95% or if the reported source stage is not `stage2`.
+The architecture-changing screens print compatible checkpoint coverage. The
+legacy scalar gate is migrated to independent logits `[z, -z]`, which preserves
+the old `dense=sigmoid(z), sparse=1-dense` function exactly at initialization.
+Stop if coverage is below 95%, if the reported source stage is not `stage2`, or
+if the migration message is missing.
+
+## 3.1 Run the Corrected B1/B2 Screens
+
+The original A0-A5 outputs are frozen evidence and must not be overwritten.
+Run only these two follow-up screens after updating the code:
+
+```bash
+python train.py --config configs/screen_v11b_dual_gate_migrated.yaml
+python train.py --config configs/screen_v11b_full_migrated.yaml
+```
+
+Both runs still start from the same frozen V1 Stage 2 `best.pth`. B1 repeats A2
+with function-preserving gate migration; B2 repeats A5 with the same migration.
+Their checkpoints, experiment outputs and TensorBoard runs use new directories.
+
+At startup both commands must report:
+
+```text
+Migrated the legacy complementary fusion gate to equivalent independent logits [z, -z].
+Initialized ... (source stage: stage2); optimizer and iteration reset.
+```
+
+Do not use `--resume`. Compare B1/B2 against the existing A0/A1/A2/A5 results
+using validation metrics only.
 
 ## 4. Summarize Validation Checkpoints
 

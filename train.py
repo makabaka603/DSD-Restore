@@ -462,6 +462,85 @@ def checkpoint_stage_name(checkpoint: dict) -> str | None:
     return stage_name(checkpoint_config) if isinstance(checkpoint_config, dict) else None
 
 
+def migrate_legacy_complementary_gate(
+    state_dict: dict[str, torch.Tensor],
+    model_state: dict[str, torch.Tensor],
+) -> tuple[dict[str, torch.Tensor], tuple[str, ...]]:
+    """Map the legacy scalar gate to functionally equivalent independent gates.
+
+    The old fusion computes ``dense=sigmoid(z)`` and
+    ``sparse=1-sigmoid(z)``. The independent two-output gate preserves that
+    exact starting function with logits ``[z, -z]``.
+    """
+    old_norm_weight = "fusion.alpha.0.weight"
+    old_norm_bias = "fusion.alpha.0.bias"
+    old_linear_weight = "fusion.alpha.1.weight"
+    old_linear_bias = "fusion.alpha.1.bias"
+    new_norm_weight = "fusion.gates.0.weight"
+    new_norm_bias = "fusion.gates.0.bias"
+    new_linear_weight = "fusion.gates.1.weight"
+    new_linear_bias = "fusion.gates.1.bias"
+
+    target_keys = (
+        new_norm_weight,
+        new_norm_bias,
+        new_linear_weight,
+        new_linear_bias,
+    )
+    if not all(name in model_state for name in target_keys):
+        return state_dict, ()
+    if all(name in state_dict for name in target_keys):
+        return state_dict, ()
+
+    source_keys = (
+        old_norm_weight,
+        old_norm_bias,
+        old_linear_weight,
+        old_linear_bias,
+    )
+    present_source_keys = [name for name in source_keys if name in state_dict]
+    if not present_source_keys:
+        return state_dict, ()
+    missing_source_keys = [name for name in source_keys if name not in state_dict]
+    if missing_source_keys:
+        raise RuntimeError(
+            "Cannot migrate a partial legacy fusion gate; missing keys: "
+            f"{missing_source_keys}"
+        )
+
+    old_weight = state_dict[old_linear_weight]
+    old_bias = state_dict[old_linear_bias]
+    translated = dict(state_dict)
+    translated[new_norm_weight] = state_dict[old_norm_weight].clone()
+    translated[new_norm_bias] = state_dict[old_norm_bias].clone()
+    translated[new_linear_weight] = torch.cat(
+        [old_weight, -old_weight],
+        dim=0,
+    )
+    translated[new_linear_bias] = torch.cat(
+        [old_bias, -old_bias],
+        dim=0,
+    )
+    shape_mismatches = [
+        name
+        for name in target_keys
+        if translated[name].shape != model_state[name].shape
+    ]
+    if shape_mismatches:
+        details = {
+            name: (
+                tuple(translated[name].shape),
+                tuple(model_state[name].shape),
+            )
+            for name in shape_mismatches
+        }
+        raise RuntimeError(
+            "Legacy fusion-gate migration produced incompatible shapes: "
+            f"{details}"
+        )
+    return translated, target_keys
+
+
 def load_initial_model_weights(
     model: torch.nn.Module,
     checkpoint_path: str | Path,
@@ -488,6 +567,10 @@ def load_initial_model_weights(
         model.load_state_dict(state_dict, strict=True)
     else:
         model_state = model.state_dict()
+        state_dict, migrated_gate_keys = migrate_legacy_complementary_gate(
+            state_dict,
+            model_state,
+        )
         compatible = {
             name: value
             for name, value in state_dict.items()
@@ -516,6 +599,11 @@ def load_initial_model_weights(
             f"unexpected={len(incompatible.unexpected_keys)}, "
             f"shape_mismatches={len(shape_mismatches)}."
         )
+        if migrated_gate_keys:
+            print(
+                "  Migrated the legacy complementary fusion gate to equivalent "
+                "independent logits [z, -z]."
+            )
         if shape_mismatches:
             print(f"  Reinitialized shape-mismatched keys: {shape_mismatches}")
     return source_stage
