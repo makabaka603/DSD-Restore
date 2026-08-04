@@ -12,7 +12,7 @@ from metrics import gradient_global_norm, model_diagnostics, restoration_panel
 from metrics.training_diagnostics import multilabel_metrics_from_counts
 from models import DSDRestoreV1, DSDRestoreV2
 from models.experts.dense_expert import pool_tokens
-from train import load_initial_model_weights
+from train import configure_trainable_parameters, load_initial_model_weights
 from utils.config import load_config
 
 
@@ -573,6 +573,56 @@ def check_v21_pairwise_composition() -> None:
         )
 
 
+def check_e3_trainable_filter() -> None:
+    model = DSDRestoreV2(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+        factor_router_dim=8,
+        factor_pairwise_interaction=True,
+    )
+    trainable_parameters, trainable_names = configure_trainable_parameters(
+        model,
+        ["factor_router.dense_pair_scale"],
+    )
+    if trainable_names != ["factor_router.dense_pair_scale"]:
+        raise RuntimeError(f"Unexpected E3 trainable tensors: {trainable_names}")
+    if (
+        len(trainable_parameters) != 1
+        or trainable_parameters[0] is not model.factor_router.dense_pair_scale
+    ):
+        raise RuntimeError("E3 optimizer did not select the dense pair scale")
+    still_trainable = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    if still_trainable != trainable_names:
+        raise RuntimeError(f"E3 left base parameters trainable: {still_trainable}")
+    model.zero_grad(set_to_none=True)
+    outputs = model(torch.rand(2, 3, 64, 64))
+    outputs["restored"].square().mean().backward()
+    dense_pair_gradient = model.factor_router.dense_pair_scale.grad
+    if (
+        dense_pair_gradient is None
+        or float(dense_pair_gradient.detach().abs().sum()) <= 0
+    ):
+        raise RuntimeError("E3 dense pair scale received no gradient")
+    frozen_gradients = [
+        name
+        for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and parameter.grad is not None
+    ]
+    if frozen_gradients:
+        raise RuntimeError(f"E3 frozen parameters received gradients: {frozen_gradients}")
+    try:
+        configure_trainable_parameters(model, ["missing.parameter"])
+    except ValueError:
+        pass
+    else:
+        raise RuntimeError("Unknown trainable prefixes must fail before training")
+
+
 def check_v11_forward_backward() -> None:
     model = DSDRestoreV1(
         base_channels=16,
@@ -660,6 +710,7 @@ def check_v11_configs() -> None:
         "configs/screen_v2_factor_spatial_routing.yaml",
         "configs/screen_v2_triple_balance.yaml",
         "configs/screen_v21_pairwise_composition.yaml",
+        "configs/screen_v22_dense_pair_repair.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -760,6 +811,41 @@ def check_v11_configs() -> None:
         ]:
             raise RuntimeError(f"{name} must initialize from the V2 Stage 2 control")
 
+    e3 = load_config("configs/screen_v22_dense_pair_repair.yaml")
+    e3_sources = e3["data"]["train_sources"]
+    e3_groups = [tuple(source["include_groups"]) for source in e3_sources]
+    e3_probabilities = [float(source["probability"]) for source in e3_sources]
+    if e3_groups != [("dense_dense",), ("dense_sparse",), ("triple",)]:
+        raise RuntimeError(f"Unexpected E3 metadata groups: {e3_groups}")
+    if any(
+        abs(actual - expected) > 1e-8
+        for actual, expected in zip(e3_probabilities, (0.45, 0.40, 0.15))
+    ):
+        raise RuntimeError(f"Unexpected E3 probabilities: {e3_probabilities}")
+    if e3["model"] != v21["model"]:
+        raise RuntimeError("E3 must retain the E2 pairwise model structure")
+    if e3["optimization"].get("trainable_prefixes") != [
+        "factor_router.dense_pair_scale"
+    ]:
+        raise RuntimeError("E3 must train only the dense pair scale")
+    if (
+        int(e3["optimization"]["max_iters"]),
+        float(e3["optimization"]["lr"]),
+        float(e3["optimization"]["weight_decay"]),
+    ) != (5000, 0.0002, 0.0):
+        raise RuntimeError("Unexpected E3 optimizer settings")
+    if e3["stage"]["init_from_stage"] != "screen_v2_factor_spatial_routing":
+        raise RuntimeError("E3 must initialize from the trained V2 screen")
+    if not e3["runtime"]["init_checkpoint"].endswith(
+        "/screen_v2_factor_spatial_routing/best.pth"
+    ):
+        raise RuntimeError("E3 must initialize from the original V2 best checkpoint")
+    if tuple(e3["runtime"].get("init_allowed_missing_prefixes", ())) != (
+        "factor_router.dense_pair_scale",
+        "factor_router.sparse_pair_scale",
+    ):
+        raise RuntimeError("E3 may initialize only the two pair scales from scratch")
+
 
 def main() -> None:
     check_sparse_mask_amp()
@@ -770,6 +856,7 @@ def main() -> None:
     check_d1_shared_capacity_reallocation()
     check_v2_factor_spatial_routing()
     check_v21_pairwise_composition()
+    check_e3_trainable_filter()
     check_v11_forward_backward()
     check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
@@ -818,6 +905,7 @@ def main() -> None:
     print("D0/D1 controlled-screen configs: passed")
     print("V2 factor-spatial checkpoint migration and gradients: passed")
     print("V2 factor-spatial controlled-screen config: passed")
+    print("E3 frozen dense-pair repair configuration: passed")
     print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")

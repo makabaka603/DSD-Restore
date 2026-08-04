@@ -1,0 +1,67 @@
+base_config: screen_v21_pairwise_composition.yaml
+
+stage:
+  name: screen_v22_dense_pair_repair
+  objective: frozen_v2_dense_pair_repair
+  init_from_stage: screen_v2_factor_spatial_routing
+
+experiment:
+  name: screen_v22_dense_pair_repair
+  output_dir: experiments/screen_v22_dense_pair_repair
+
+data:
+  # E3 retains the original V2 pair distribution while increasing triple
+  # exposure conservatively from 10% to 15%.
+  train_sources:
+    - name: e3_dense_dense
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [dense_dense]
+      min_degradations: 2
+      max_degradations: 2
+      probability: 0.45
+    - name: e3_dense_sparse
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [dense_sparse]
+      min_degradations: 2
+      max_degradations: 2
+      probability: 0.40
+    - name: e3_triple
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [triple]
+      min_degradations: 3
+      max_degradations: 3
+      probability: 0.15
+
+optimization:
+  max_iters: 5000
+  lr: 0.0002
+  min_lr: 0.000002
+  warmup_iters: 200
+  weight_decay: 0.0
+  # Preserve the complete V2 solution and train only the zero-initialized
+  # dense pair adapter. Sparse pairs have no supervision in the current data.
+  trainable_prefixes:
+    - factor_router.dense_pair_scale
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/screen_v22_dense_pair_repair
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/screen_v2_factor_spatial_routing/best.pth
+  init_strict: false
+  init_min_coverage: 0.999
+  init_allowed_missing_prefixes:
+    - factor_router.dense_pair_scale
+    - factor_router.sparse_pair_scale
+  save_every_iters: 1000
+  best_window_iters: 500
+  early_stop_patience_iters: 0
+  tensorboard:
+    run_name: screen_v22_dense_pair_repair

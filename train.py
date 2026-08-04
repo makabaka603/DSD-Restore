@@ -629,6 +629,57 @@ def load_initial_model_weights(
     return source_stage
 
 
+def configure_trainable_parameters(
+    model: torch.nn.Module,
+    trainable_prefixes: str | list[str] | tuple[str, ...] | None,
+) -> tuple[list[torch.nn.Parameter], list[str]]:
+    """Select optimizer parameters while freezing everything outside prefixes."""
+    named_parameters = list(model.named_parameters())
+    if trainable_prefixes is None:
+        trainable = [
+            (name, parameter)
+            for name, parameter in named_parameters
+            if parameter.requires_grad
+        ]
+        return [parameter for _, parameter in trainable], [
+            name for name, _ in trainable
+        ]
+
+    if isinstance(trainable_prefixes, str):
+        trainable_prefixes = [trainable_prefixes]
+    if not isinstance(trainable_prefixes, (list, tuple)):
+        raise TypeError(
+            "optimization.trainable_prefixes must be a string or a list of strings"
+        )
+    prefixes = tuple(
+        str(prefix).strip() for prefix in trainable_prefixes if str(prefix).strip()
+    )
+    if not prefixes:
+        raise ValueError("optimization.trainable_prefixes cannot be empty")
+
+    parameter_names = [name for name, _ in named_parameters]
+    unmatched = [
+        prefix
+        for prefix in prefixes
+        if not any(name.startswith(prefix) for name in parameter_names)
+    ]
+    if unmatched:
+        raise ValueError(
+            "optimization.trainable_prefixes matched no parameters: "
+            f"{unmatched}"
+        )
+
+    trainable = []
+    for name, parameter in named_parameters:
+        selected = any(name.startswith(prefix) for prefix in prefixes)
+        parameter.requires_grad_(selected)
+        if selected:
+            trainable.append((name, parameter))
+    if not trainable:
+        raise RuntimeError("No trainable parameters remain after prefix filtering")
+    return [parameter for _, parameter in trainable], [name for name, _ in trainable]
+
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -741,9 +792,30 @@ def train(
     model = model.to(device)
     if channels_last_enabled:
         model = model.to(memory_format=torch.channels_last)
+    configured_trainable_prefixes = cfg["optimization"].get(
+        "trainable_prefixes"
+    )
+    trainable_parameters, trainable_names = configure_trainable_parameters(
+        model,
+        configured_trainable_prefixes,
+    )
+    total_numel = sum(parameter.numel() for parameter in model.parameters())
+    trainable_numel = sum(parameter.numel() for parameter in trainable_parameters)
+    print(
+        f"Trainable parameters: {trainable_numel:,}/{total_numel:,} "
+        f"({trainable_numel / max(total_numel, 1):.6%}) across "
+        f"{len(trainable_names)} tensors."
+    )
+    if configured_trainable_prefixes is not None:
+        for name in trainable_names:
+            print(f"  trainable: {name}")
     perceptual = PerceptualMetrics(device)
     criterion = DSDRestoreV1Loss(**cfg["loss"])
-    optim = AdamW(model.parameters(), lr=cfg["optimization"]["lr"], weight_decay=cfg["optimization"]["weight_decay"])
+    optim = AdamW(
+        trainable_parameters,
+        lr=cfg["optimization"]["lr"],
+        weight_decay=cfg["optimization"]["weight_decay"],
+    )
     max_iters = cfg["optimization"]["max_iters"]
     scheduler = build_scheduler(
         optim,
