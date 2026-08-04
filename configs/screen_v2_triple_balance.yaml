@@ -1,0 +1,47 @@
+base_config: screen_v2_factor_spatial_routing.yaml
+
+stage:
+  name: screen_v2_triple_balance
+  objective: v2_triple_sampling_balance
+  init_from_stage: stage2
+
+experiment:
+  name: screen_v2_triple_balance
+  output_dir: experiments/screen_v2_triple_balance
+
+data:
+  # E1 changes only the Stage 3 composite sampling distribution. Splitting the
+  # frozen paired dataset by metadata preserves every image and degradation.
+  train_sources:
+    - name: v2tb_dense_dense
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [dense_dense]
+      min_degradations: 2
+      max_degradations: 2
+      probability: 0.40
+    - name: v2tb_dense_sparse
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [dense_sparse]
+      min_degradations: 2
+      max_degradations: 2
+      probability: 0.35
+    - name: v2tb_triple
+      input_dir: datasets/SyntheticCompositeTrain/input
+      gt_dir: datasets/SyntheticCompositeTrain/gt
+      metadata_path: datasets/SyntheticCompositeTrain/metadata.json
+      require_metadata: true
+      include_groups: [triple]
+      min_degradations: 3
+      max_degradations: 3
+      probability: 0.25
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/screen_v2_triple_balance
+  tensorboard:
+    run_name: screen_v2_triple_balance

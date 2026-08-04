@@ -1,0 +1,20 @@
+base_config: screen_v2_factor_spatial_routing.yaml
+
+stage:
+  name: screen_v21_pairwise_composition
+  objective: second_order_factor_composition
+  init_from_stage: stage2
+
+experiment:
+  name: screen_v21_pairwise_composition
+  output_dir: experiments/screen_v21_pairwise_composition
+
+model:
+  # E2 keeps the original 50/40/10 Stage 3 sampling and adds only a bounded,
+  # zero-initialized second-order interaction between degradation factors.
+  factor_pairwise_interaction: true
+
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/screen_v21_pairwise_composition
+  tensorboard:
+    run_name: screen_v21_pairwise_composition

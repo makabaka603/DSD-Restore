@@ -483,6 +483,96 @@ def check_v2_factor_spatial_routing() -> None:
         )
 
 
+def check_v21_pairwise_composition() -> None:
+    torch.manual_seed(37)
+    v2 = DSDRestoreV2(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+        factor_router_dim=8,
+    )
+    v21 = DSDRestoreV2(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+        factor_router_dim=8,
+        factor_pairwise_interaction=True,
+    )
+    incompatible = v21.load_state_dict(v2.state_dict(), strict=False)
+    expected_missing = {
+        "factor_router.dense_pair_scale",
+        "factor_router.sparse_pair_scale",
+    }
+    if set(incompatible.missing_keys) != expected_missing:
+        raise RuntimeError(
+            "Unexpected V2.1 missing parameters: "
+            f"{incompatible.missing_keys}"
+        )
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Unexpected V2 parameters while initializing V2.1: "
+            f"{incompatible.unexpected_keys}"
+        )
+    if torch.count_nonzero(v21.factor_router.dense_pair_scale).item():
+        raise RuntimeError("V2.1 dense pair scale is not zero-initialized")
+    if torch.count_nonzero(v21.factor_router.sparse_pair_scale).item():
+        raise RuntimeError("V2.1 sparse pair scale is not zero-initialized")
+
+    image = torch.rand(2, 3, 64, 64)
+    v2.eval()
+    v21.eval()
+    with torch.no_grad():
+        v2_outputs = v2(image)
+        v21_outputs = v21(image)
+    torch.testing.assert_close(
+        v21_outputs["restored"],
+        v2_outputs["restored"],
+        rtol=1e-5,
+        atol=1e-6,
+        msg="Zero-initialized V2.1 pair routing changed the V2 output",
+    )
+    for family in ("dense", "sparse"):
+        key = f"factor_{family}_pair_modulation"
+        if key not in v21_outputs or not torch.isfinite(v21_outputs[key]).all():
+            raise RuntimeError(f"Missing or non-finite V2.1 output: {key}")
+
+    v21.train()
+    v21.zero_grad(set_to_none=True)
+    train_outputs = v21(image)
+    train_outputs["restored"].square().mean().backward()
+    pair_scale_gradient = sum(
+        float(parameter.grad.detach().abs().sum())
+        for name, parameter in v21.named_parameters()
+        if name in {
+            "factor_router.dense_pair_scale",
+            "factor_router.sparse_pair_scale",
+        }
+        and parameter.grad is not None
+    )
+    if pair_scale_gradient <= 0:
+        raise RuntimeError("V2.1 zero pair scales received no gradient")
+
+    diagnostics = model_diagnostics(
+        train_outputs,
+        {
+            "dense_label": torch.zeros(2, 5),
+            "sparse_label": torch.zeros(2, 4),
+            "task": ["smoke", "smoke"],
+        },
+    )
+    required = {
+        "factor_routing/dense/pair_modulation_rms",
+        "factor_routing/sparse/pair_modulation_rms",
+        "factor_routing/dense/pair_scale_rms",
+        "factor_routing/sparse/pair_scale_rms",
+    }
+    missing = required - diagnostics.keys()
+    if missing:
+        raise RuntimeError(
+            f"Missing V2.1 pair-routing diagnostics: {sorted(missing)}"
+        )
+
+
 def check_v11_forward_backward() -> None:
     model = DSDRestoreV1(
         base_channels=16,
@@ -568,6 +658,8 @@ def check_v11_configs() -> None:
         "configs/screen_d0_triple_balance.yaml",
         "configs/screen_d1_shared_capacity.yaml",
         "configs/screen_v2_factor_spatial_routing.yaml",
+        "configs/screen_v2_triple_balance.yaml",
+        "configs/screen_v21_pairwise_composition.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -631,6 +723,43 @@ def check_v11_configs() -> None:
     ):
         raise RuntimeError("V2 may initialize only factor_router.* from scratch")
 
+    v2tb = load_config("configs/screen_v2_triple_balance.yaml")
+    v2tb_sources = v2tb["data"]["train_sources"]
+    v2tb_groups = [
+        tuple(source["include_groups"]) for source in v2tb_sources
+    ]
+    v2tb_probabilities = [
+        float(source["probability"]) for source in v2tb_sources
+    ]
+    if v2tb_groups != [("dense_dense",), ("dense_sparse",), ("triple",)]:
+        raise RuntimeError(f"Unexpected E1 metadata groups: {v2tb_groups}")
+    if any(
+        abs(actual - expected) > 1e-8
+        for actual, expected in zip(
+            v2tb_probabilities, (0.40, 0.35, 0.25)
+        )
+    ):
+        raise RuntimeError(f"Unexpected E1 probabilities: {v2tb_probabilities}")
+    if v2tb["model"] != v2["model"]:
+        raise RuntimeError("E1 must change V2 sampling without changing the model")
+
+    v21 = load_config("configs/screen_v21_pairwise_composition.yaml")
+    if not bool(v21["model"].get("factor_pairwise_interaction", False)):
+        raise RuntimeError("E2 must enable pairwise factor interaction")
+    v21_model_without_pairwise = dict(v21["model"])
+    v21_model_without_pairwise.pop("factor_pairwise_interaction")
+    if v21_model_without_pairwise != v2["model"]:
+        raise RuntimeError("E2 must change only the V2 pairwise model flag")
+    if v21["data"]["train_sources"] != v2["data"]["train_sources"]:
+        raise RuntimeError("E2 must retain the original V2 training sampling")
+    for config, name in ((v2tb, "E1"), (v21, "E2")):
+        if int(config["optimization"]["max_iters"]) != 15000:
+            raise RuntimeError(f"{name} must remain a 15k validation screen")
+        if config["runtime"]["init_checkpoint"] != v2["runtime"][
+            "init_checkpoint"
+        ]:
+            raise RuntimeError(f"{name} must initialize from the V2 Stage 2 control")
+
 
 def main() -> None:
     check_sparse_mask_amp()
@@ -640,6 +769,7 @@ def main() -> None:
     check_v2lite_multiscale_identity_and_gradients()
     check_d1_shared_capacity_reallocation()
     check_v2_factor_spatial_routing()
+    check_v21_pairwise_composition()
     check_v11_forward_backward()
     check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)

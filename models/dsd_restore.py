@@ -49,6 +49,7 @@ class DSDRestoreV1(nn.Module):
         factor_spatial_routing: bool = False,
         factor_router_dim: int = 32,
         factor_router_temperature: float = 1.0,
+        factor_pairwise_interaction: bool = False,
     ):
         super().__init__()
         if dense_expert_blocks < 1 or sparse_expert_blocks < 1:
@@ -115,6 +116,7 @@ class DSDRestoreV1(nn.Module):
                 token_dim,
                 router_dim=factor_router_dim,
                 temperature=factor_router_temperature,
+                pairwise_interaction=factor_pairwise_interaction,
             )
             if factor_spatial_routing
             else None
@@ -226,22 +228,38 @@ class DSDRestoreV1(nn.Module):
             "sparse_prototypes": prototypes["sparse_prototypes"],
         }
         if factor_routing_outputs:
-            outputs.update(
-                {
-                    "factor_dense_spatial_gates": factor_routing_outputs[
-                        "dense_factor_gates"
-                    ],
-                    "factor_sparse_spatial_gates": factor_routing_outputs[
-                        "sparse_factor_gates"
-                    ],
-                    "factor_dense_modulation": factor_routing_outputs[
-                        "dense_modulation"
-                    ],
-                    "factor_sparse_modulation": factor_routing_outputs[
-                        "sparse_modulation"
-                    ],
-                }
-            )
+            routing_diagnostics = {
+                "factor_dense_spatial_gates": factor_routing_outputs[
+                    "dense_factor_gates"
+                ],
+                "factor_sparse_spatial_gates": factor_routing_outputs[
+                    "sparse_factor_gates"
+                ],
+                "factor_dense_modulation": factor_routing_outputs[
+                    "dense_modulation"
+                ],
+                "factor_sparse_modulation": factor_routing_outputs[
+                    "sparse_modulation"
+                ],
+            }
+            if "dense_pair_modulation" in factor_routing_outputs:
+                routing_diagnostics.update(
+                    {
+                        "factor_dense_pair_modulation": factor_routing_outputs[
+                            "dense_pair_modulation"
+                        ],
+                        "factor_sparse_pair_modulation": factor_routing_outputs[
+                            "sparse_pair_modulation"
+                        ],
+                        "factor_dense_pair_scale": factor_routing_outputs[
+                            "dense_pair_scale"
+                        ],
+                        "factor_sparse_pair_scale": factor_routing_outputs[
+                            "sparse_pair_scale"
+                        ],
+                    }
+                )
+            outputs.update(routing_diagnostics)
         outputs.update(multiscale_outputs)
         return outputs
 
@@ -253,6 +271,7 @@ class DSDRestoreV2(DSDRestoreV1):
         self,
         factor_router_dim: int = 32,
         factor_router_temperature: float = 1.0,
+        factor_pairwise_interaction: bool = False,
         **kwargs,
     ):
         kwargs.pop("factor_spatial_routing", None)
@@ -260,5 +279,6 @@ class DSDRestoreV2(DSDRestoreV1):
             factor_spatial_routing=True,
             factor_router_dim=factor_router_dim,
             factor_router_temperature=factor_router_temperature,
+            factor_pairwise_interaction=factor_pairwise_interaction,
             **kwargs,
         )

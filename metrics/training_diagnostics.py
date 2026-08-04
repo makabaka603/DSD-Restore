@@ -272,6 +272,15 @@ def model_diagnostics(
             result[f"factor_routing/{family}/modulation_rms"] = (
                 modulation.square().mean().sqrt()
             )
+            pair_modulation = outputs.get(f"factor_{family}_pair_modulation")
+            pair_scale = outputs.get(f"factor_{family}_pair_scale")
+            if pair_modulation is not None and pair_scale is not None:
+                result[f"factor_routing/{family}/pair_modulation_rms"] = (
+                    pair_modulation.float().square().mean().sqrt()
+                )
+                result[f"factor_routing/{family}/pair_scale_rms"] = (
+                    pair_scale.float().square().mean().sqrt()
+                )
     for level_name in ("f1", "f2", "f3", "f4"):
         residual_key = f"multiscale_residual_{level_name}"
         if residual_key not in outputs:
