@@ -14,7 +14,8 @@ V1 follows the project documents:
 - V1 losses: reconstruction, SSIM, frequency, color, and degradation classification
 
 The V1 Word specification includes the compositional prototype bank, so it is
-implemented here. Physics-frequency fusion and real no-GT adaptation remain V2/V3 work.
+implemented here. The controlled V2 factor-spatial router is also available;
+physics-frequency fusion and real no-GT adaptation remain later follow-up work.
 
 ## Recommended Hardware and Environment
 
@@ -87,6 +88,11 @@ After the V1.1 and V2-lite C1 screens, use the independent D0 sampling-balance
 and D1 shared-capacity screens before attempting a full V2. Their frozen
 controls, commands and go/no-go criteria are documented in
 [`docs/D0_D1_RUNBOOK.md`](docs/D0_D1_RUNBOOK.md).
+
+D0 and D1 both failed their validation gates, so the next controlled model is
+V2 degradation-factor spatial routing. It keeps the frozen A1 training controls
+and adds identity-initialized per-factor bottleneck maps; see
+[`docs/V2_FACTOR_ROUTING_RUNBOOK.md`](docs/V2_FACTOR_ROUTING_RUNBOOK.md).
 
 ## Data
 

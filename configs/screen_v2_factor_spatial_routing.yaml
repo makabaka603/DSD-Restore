@@ -1,0 +1,30 @@
+base_config: screen_v11_aux_off.yaml
+
+stage:
+  name: screen_v2_factor_spatial_routing
+  objective: degradation_factor_spatial_routing_screen
+  init_from_stage: stage2
+
+experiment:
+  name: screen_v2_factor_spatial_routing
+  output_dir: experiments/screen_v2_factor_spatial_routing
+
+model:
+  type: dsd_restore_v2
+  # A 32-D query/key space creates one bottleneck-resolution map for every
+  # dense and sparse degradation token. The zero-initialized channel scales
+  # make V2 exactly equivalent to Stage 2 before the first optimizer update.
+  factor_router_dim: 32
+  factor_router_temperature: 1.0
+
+# This screen intentionally inherits the original Stage 3 composite mixture,
+# A1 auxiliary losses off, seed 42, 15k iterations and all optimizer settings.
+runtime:
+  checkpoint_dir: /root/autodl-tmp/DSD-Restor-checkpoints/screen_v2_factor_spatial_routing
+  init_checkpoint: /root/autodl-tmp/DSD-Restor-checkpoints/v1_stage2_joint/best.pth
+  init_strict: false
+  init_min_coverage: 0.99
+  init_allowed_missing_prefixes:
+    - factor_router.
+  tensorboard:
+    run_name: screen_v2_factor_spatial_routing

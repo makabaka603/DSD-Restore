@@ -17,6 +17,7 @@ SCREEN_RUNS = (
     "v2lite_screen_c1_multiscale",
     "screen_d0_triple_balance",
     "screen_d1_shared_capacity",
+    "screen_v2_factor_spatial_routing",
 )
 
 

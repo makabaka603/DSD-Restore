@@ -12,6 +12,7 @@ from .experts import DenseDegradationExpert, SparseOcclusionExpert
 from .experts.dense_expert import pool_tokens
 from .fusion import SimpleDenseSparseFusion
 from .prototype import CompositionalPrototypeBank
+from .routing import FactorSpatialRouter
 from .tokenizer import DegradationTokenizer
 
 
@@ -45,6 +46,9 @@ class DSDRestoreV1(nn.Module):
         dense_expert_blocks: int = 4,
         sparse_expert_blocks: int = 4,
         shared_bottleneck_blocks: int = 0,
+        factor_spatial_routing: bool = False,
+        factor_router_dim: int = 32,
+        factor_router_temperature: float = 1.0,
     ):
         super().__init__()
         if dense_expert_blocks < 1 or sparse_expert_blocks < 1:
@@ -105,6 +109,16 @@ class DSDRestoreV1(nn.Module):
             num_blocks=sparse_expert_blocks,
             token_pooling=token_pooling,
         )
+        self.factor_router = (
+            FactorSpatialRouter(
+                bottleneck_channels,
+                token_dim,
+                router_dim=factor_router_dim,
+                temperature=factor_router_temperature,
+            )
+            if factor_spatial_routing
+            else None
+        )
         self.fusion = SimpleDenseSparseFusion(
             bottleneck_channels,
             token_dim,
@@ -160,6 +174,19 @@ class DSDRestoreV1(nn.Module):
             tokens["sparse_logits"],
             prototypes["sparse_context"],
         )
+        factor_routing_outputs: dict[str, torch.Tensor] = {}
+        if self.factor_router is not None:
+            factor_routing_outputs = self.factor_router(
+                features[-1],
+                dense["feature"],
+                sparse["feature"],
+                tokens["dense_tokens"],
+                tokens["sparse_tokens"],
+                tokens["dense_logits"],
+                tokens["sparse_logits"],
+            )
+            dense["feature"] = factor_routing_outputs["dense_feature"]
+            sparse["feature"] = factor_routing_outputs["sparse_feature"]
         fused, dense_gate, sparse_gate = self.fusion(
             features[-1],
             dense["feature"],
@@ -198,5 +225,40 @@ class DSDRestoreV1(nn.Module):
             "dense_prototypes": prototypes["dense_prototypes"],
             "sparse_prototypes": prototypes["sparse_prototypes"],
         }
+        if factor_routing_outputs:
+            outputs.update(
+                {
+                    "factor_dense_spatial_gates": factor_routing_outputs[
+                        "dense_factor_gates"
+                    ],
+                    "factor_sparse_spatial_gates": factor_routing_outputs[
+                        "sparse_factor_gates"
+                    ],
+                    "factor_dense_modulation": factor_routing_outputs[
+                        "dense_modulation"
+                    ],
+                    "factor_sparse_modulation": factor_routing_outputs[
+                        "sparse_modulation"
+                    ],
+                }
+            )
         outputs.update(multiscale_outputs)
         return outputs
+
+
+class DSDRestoreV2(DSDRestoreV1):
+    """V2 with degradation-factor spatial routing at the bottleneck."""
+
+    def __init__(
+        self,
+        factor_router_dim: int = 32,
+        factor_router_temperature: float = 1.0,
+        **kwargs,
+    ):
+        kwargs.pop("factor_spatial_routing", None)
+        super().__init__(
+            factor_spatial_routing=True,
+            factor_router_dim=factor_router_dim,
+            factor_router_temperature=factor_router_temperature,
+            **kwargs,
+        )

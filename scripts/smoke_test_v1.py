@@ -10,7 +10,7 @@ from losses import DSDRestoreV1Loss
 from losses.v1_losses import sparse_mask_loss
 from metrics import gradient_global_norm, model_diagnostics, restoration_panel
 from metrics.training_diagnostics import multilabel_metrics_from_counts
-from models import DSDRestoreV1
+from models import DSDRestoreV1, DSDRestoreV2
 from models.experts.dense_expert import pool_tokens
 from train import load_initial_model_weights
 from utils.config import load_config
@@ -368,6 +368,121 @@ def check_d1_shared_capacity_reallocation() -> None:
         raise RuntimeError("D1 shared zero-residual scales received no gradient")
 
 
+def check_v2_factor_spatial_routing() -> None:
+    legacy = DSDRestoreV1()
+    v2 = DSDRestoreV2()
+    legacy_parameters = sum(parameter.numel() for parameter in legacy.parameters())
+    v2_parameters = sum(parameter.numel() for parameter in v2.parameters())
+    parameter_change = (v2_parameters - legacy_parameters) / legacy_parameters
+    if not (0.0 < parameter_change <= 0.03):
+        raise RuntimeError(
+            "V2 factor router must add at most 3% parameters, found "
+            f"{parameter_change:+.2%} ({legacy_parameters:,} -> {v2_parameters:,})"
+        )
+    if v2.factor_router is None:
+        raise RuntimeError("V2 factor-spatial router is disabled")
+    if torch.count_nonzero(v2.factor_router.dense_scale).item():
+        raise RuntimeError("V2 dense modulation scale is not zero-initialized")
+    if torch.count_nonzero(v2.factor_router.sparse_scale).item():
+        raise RuntimeError("V2 sparse modulation scale is not zero-initialized")
+
+    torch.manual_seed(31)
+    small_legacy = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+    )
+    small_v2 = DSDRestoreV2(
+        base_channels=8,
+        token_dim=16,
+        backbone_type="simple",
+        factor_router_dim=8,
+    )
+    small_legacy.eval()
+    small_v2.eval()
+    image = torch.rand(2, 3, 64, 64)
+    with torch.no_grad():
+        legacy_outputs = small_legacy(image)
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint_path = Path(directory) / "legacy_stage2.pth"
+        torch.save(
+            {
+                "model": small_legacy.state_dict(),
+                "config": {"stage": {"name": "stage2"}},
+            },
+            checkpoint_path,
+        )
+        load_initial_model_weights(
+            small_v2,
+            checkpoint_path,
+            {
+                "stage": {
+                    "name": "screen_v2_factor_spatial_routing",
+                    "init_from_stage": "stage2",
+                },
+                "runtime": {
+                    "init_strict": False,
+                    "init_min_coverage": 0.99,
+                    "init_allowed_missing_prefixes": ["factor_router."],
+                },
+            },
+        )
+    with torch.no_grad():
+        v2_outputs = small_v2(image)
+    torch.testing.assert_close(
+        v2_outputs["restored"],
+        legacy_outputs["restored"],
+        rtol=1e-5,
+        atol=1e-6,
+        msg="Zero-initialized V2 factor routing changed the Stage 2 output",
+    )
+    if v2_outputs["factor_dense_spatial_gates"].shape[1] != 5:
+        raise RuntimeError("V2 must emit five dense factor maps")
+    if v2_outputs["factor_sparse_spatial_gates"].shape[1] != 4:
+        raise RuntimeError("V2 must emit four sparse factor maps")
+    for name in ("factor_dense_spatial_gates", "factor_sparse_spatial_gates"):
+        gates = v2_outputs[name]
+        if float(gates.min()) < 0.0 or float(gates.max()) > 1.0:
+            raise RuntimeError(f"V2 spatial gates are outside [0, 1]: {name}")
+
+    small_v2.train()
+    small_v2.zero_grad(set_to_none=True)
+    train_outputs = small_v2(image)
+    train_outputs["restored"].square().mean().backward()
+    scale_gradient = sum(
+        float(parameter.grad.detach().abs().sum())
+        for name, parameter in small_v2.named_parameters()
+        if name in {
+            "factor_router.dense_scale",
+            "factor_router.sparse_scale",
+        }
+        and parameter.grad is not None
+    )
+    if scale_gradient <= 0:
+        raise RuntimeError("V2 zero modulation scales received no gradient")
+    diagnostics = model_diagnostics(
+        train_outputs,
+        {
+            "dense_label": torch.zeros(2, 5),
+            "sparse_label": torch.zeros(2, 4),
+            "task": ["smoke", "smoke"],
+        },
+    )
+    required = {
+        "factor_routing/dense/dust/mean",
+        "factor_routing/dense/haze/coverage",
+        "factor_routing/sparse/rain/mean",
+        "factor_routing/sparse/snow/coverage",
+        "factor_routing/dense/modulation_rms",
+        "factor_routing/sparse/modulation_rms",
+    }
+    missing = required - diagnostics.keys()
+    if missing:
+        raise RuntimeError(
+            f"Missing V2 factor-routing diagnostics: {sorted(missing)}"
+        )
+
+
 def check_v11_forward_backward() -> None:
     model = DSDRestoreV1(
         base_channels=16,
@@ -452,6 +567,7 @@ def check_v11_configs() -> None:
         "configs/screen_v2lite_c1_multiscale.yaml",
         "configs/screen_d0_triple_balance.yaml",
         "configs/screen_d1_shared_capacity.yaml",
+        "configs/screen_v2_factor_spatial_routing.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -492,6 +608,29 @@ def check_v11_configs() -> None:
         if int(config["optimization"]["max_iters"]) != 15000:
             raise RuntimeError(f"{name} must remain a 15k validation screen")
 
+    v2 = load_config("configs/screen_v2_factor_spatial_routing.yaml")
+    if v2["model"].get("type") != "dsd_restore_v2":
+        raise RuntimeError("V2 screen must build dsd_restore_v2")
+    if int(v2["model"].get("factor_router_dim", 0)) != 32:
+        raise RuntimeError("V2 screen must use a 32-D factor router")
+    if float(v2["model"].get("factor_router_temperature", 0.0)) != 1.0:
+        raise RuntimeError("V2 screen must use router temperature 1.0")
+    if v2["data"]["train_sources"] != load_config(
+        "configs/screen_v11_aux_off.yaml"
+    )["data"]["train_sources"]:
+        raise RuntimeError("V2 must retain the frozen A1/Stage 3 sampling")
+    if tuple(
+        float(v2["loss"][key])
+        for key in ("lambda_cls", "lambda_proto", "lambda_sparse")
+    ) != (0.0, 0.0, 0.0):
+        raise RuntimeError("V2 must retain the A1 auxiliary-loss control")
+    if int(v2["optimization"]["max_iters"]) != 15000:
+        raise RuntimeError("V2 must remain a 15k validation screen")
+    if tuple(v2["runtime"].get("init_allowed_missing_prefixes", ())) != (
+        "factor_router.",
+    ):
+        raise RuntimeError("V2 may initialize only factor_router.* from scratch")
+
 
 def main() -> None:
     check_sparse_mask_amp()
@@ -500,6 +639,7 @@ def main() -> None:
     check_v11_checkpoint_compatibility()
     check_v2lite_multiscale_identity_and_gradients()
     check_d1_shared_capacity_reallocation()
+    check_v2_factor_spatial_routing()
     check_v11_forward_backward()
     check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
@@ -546,6 +686,8 @@ def main() -> None:
     print("V2-lite C1 identity initialization and gradients: passed")
     print("D1 shared-capacity checkpoint migration and gradients: passed")
     print("D0/D1 controlled-screen configs: passed")
+    print("V2 factor-spatial checkpoint migration and gradients: passed")
+    print("V2 factor-spatial controlled-screen config: passed")
     print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")

@@ -234,6 +234,44 @@ def model_diagnostics(
             + torch.abs(mask[:, :, :, 1:] - mask[:, :, :, :-1]).mean()
         ),
     }
+    dense_factor_gates = outputs.get("factor_dense_spatial_gates")
+    sparse_factor_gates = outputs.get("factor_sparse_spatial_gates")
+    if dense_factor_gates is not None and sparse_factor_gates is not None:
+        dense_factor_gates = dense_factor_gates.float()
+        sparse_factor_gates = sparse_factor_gates.float()
+        result["factor_routing/dense/mean"] = dense_factor_gates.mean()
+        result["factor_routing/dense/std"] = dense_factor_gates.std(
+            unbiased=False
+        )
+        result["factor_routing/sparse/mean"] = sparse_factor_gates.mean()
+        result["factor_routing/sparse/std"] = sparse_factor_gates.std(
+            unbiased=False
+        )
+        for family, gates, configured_names in (
+            ("dense", dense_factor_gates, DENSE_NAMES),
+            ("sparse", sparse_factor_gates, SPARSE_NAMES),
+        ):
+            names = list(configured_names[: gates.shape[1]])
+            names.extend(
+                f"factor_{index}"
+                for index in range(len(names), gates.shape[1])
+            )
+            for index, name in enumerate(names):
+                factor_gate = gates[:, index]
+                result[f"factor_routing/{family}/{name}/mean"] = (
+                    factor_gate.mean()
+                )
+                result[f"factor_routing/{family}/{name}/std"] = (
+                    factor_gate.std(unbiased=False)
+                )
+                result[f"factor_routing/{family}/{name}/coverage"] = (
+                    (factor_gate >= 0.5).float().mean()
+                )
+        for family in ("dense", "sparse"):
+            modulation = outputs[f"factor_{family}_modulation"].float()
+            result[f"factor_routing/{family}/modulation_rms"] = (
+                modulation.square().mean().sqrt()
+            )
     for level_name in ("f1", "f2", "f3", "f4"):
         residual_key = f"multiscale_residual_{level_name}"
         if residual_key not in outputs:
@@ -276,6 +314,13 @@ def model_diagnostics(
             f"routing/sparse_gate_by_task/{task}"
         ] = sparse_gate[indices].mean()
         result[f"mask/coverage_by_task/{task}"] = mask[indices].mean()
+        if dense_factor_gates is not None and sparse_factor_gates is not None:
+            result[f"factor_routing/dense_by_task/{task}"] = (
+                dense_factor_gates[indices].mean()
+            )
+            result[f"factor_routing/sparse_by_task/{task}"] = (
+                sparse_factor_gates[indices].mean()
+            )
 
     result.update(
         _prototype_stats(
