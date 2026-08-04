@@ -279,6 +279,95 @@ def check_v2lite_multiscale_identity_and_gradients() -> None:
         )
 
 
+def check_d1_shared_capacity_reallocation() -> None:
+    legacy = DSDRestoreV1()
+    d1 = DSDRestoreV1(
+        dense_expert_blocks=2,
+        sparse_expert_blocks=2,
+        shared_bottleneck_blocks=4,
+    )
+    legacy_parameters = sum(parameter.numel() for parameter in legacy.parameters())
+    d1_parameters = sum(parameter.numel() for parameter in d1.parameters())
+    parameter_change = (d1_parameters - legacy_parameters) / legacy_parameters
+    if not (-0.03 <= parameter_change < 0.0):
+        raise RuntimeError(
+            "D1 must reduce V1 parameters by less than 3%, found "
+            f"{parameter_change:+.2%} ({legacy_parameters:,} -> {d1_parameters:,})"
+        )
+    if len(d1.dense_expert.blocks) != 2 or len(d1.sparse_expert.blocks) != 2:
+        raise RuntimeError("D1 expert depths are not 2/2")
+    if len(d1.shared_bottleneck) != 4:
+        raise RuntimeError("D1 shared bottleneck depth is not 4")
+    residual_scales = [
+        parameter
+        for name, parameter in d1.shared_bottleneck.named_parameters()
+        if name.endswith("beta") or name.endswith("gamma")
+    ]
+    if len(residual_scales) != 8:
+        raise RuntimeError("D1 shared bottleneck must expose 8 zero residual scales")
+    if any(torch.count_nonzero(parameter).item() for parameter in residual_scales):
+        raise RuntimeError("D1 shared NAFBlocks are not identity-initialized")
+
+    legacy_reference = legacy.state_dict()[
+        "dense_expert.blocks.0.large_kernel.weight"
+    ].clone()
+    with tempfile.TemporaryDirectory() as directory:
+        checkpoint_path = Path(directory) / "legacy_stage2.pth"
+        torch.save(
+            {
+                "model": legacy.state_dict(),
+                "config": {"stage": {"name": "stage2"}},
+            },
+            checkpoint_path,
+        )
+        load_initial_model_weights(
+            d1,
+            checkpoint_path,
+            {
+                "stage": {
+                    "name": "screen_d1_shared_capacity",
+                    "init_from_stage": "stage2",
+                },
+                "runtime": {
+                    "init_strict": False,
+                    "init_min_coverage": 0.80,
+                    "init_allowed_missing_prefixes": [
+                        "shared_bottleneck.",
+                    ],
+                },
+            },
+        )
+    torch.testing.assert_close(
+        d1.state_dict()["dense_expert.blocks.0.large_kernel.weight"],
+        legacy_reference,
+        msg="D1 did not inherit retained expert blocks from Stage 2",
+    )
+    if any(torch.count_nonzero(parameter).item() for parameter in residual_scales):
+        raise RuntimeError("D1 checkpoint loading changed zero residual scales")
+
+    small_d1 = DSDRestoreV1(
+        base_channels=8,
+        token_dim=16,
+        dense_expert_blocks=2,
+        sparse_expert_blocks=2,
+        shared_bottleneck_blocks=4,
+    )
+    image = torch.rand(1, 3, 64, 64)
+    outputs = small_d1(image)
+    if not torch.isfinite(outputs["restored"]).all():
+        raise RuntimeError("D1 forward produced non-finite restored pixels")
+    outputs["restored"].square().mean().backward()
+    scale_gradient = sum(
+        float(parameter.grad.detach().abs().sum())
+        for name, parameter in small_d1.named_parameters()
+        if name.startswith("shared_bottleneck.")
+        and (name.endswith("beta") or name.endswith("gamma"))
+        and parameter.grad is not None
+    )
+    if scale_gradient <= 0:
+        raise RuntimeError("D1 shared zero-residual scales received no gradient")
+
+
 def check_v11_forward_backward() -> None:
     model = DSDRestoreV1(
         base_channels=16,
@@ -361,6 +450,8 @@ def check_v11_configs() -> None:
         "configs/screen_v11b_dual_gate_migrated.yaml",
         "configs/screen_v11b_full_migrated.yaml",
         "configs/screen_v2lite_c1_multiscale.yaml",
+        "configs/screen_d0_triple_balance.yaml",
+        "configs/screen_d1_shared_capacity.yaml",
         "configs/smoke_v11.yaml",
         "configs/train_v11_stage1.yaml",
         "configs/train_v11_stage2.yaml",
@@ -371,6 +462,36 @@ def check_v11_configs() -> None:
         if "model" not in config or "loss" not in config:
             raise RuntimeError(f"Incomplete V1.1 config: {config_path}")
 
+    d0 = load_config("configs/screen_d0_triple_balance.yaml")
+    d0_sources = d0["data"]["train_sources"]
+    d0_probabilities = [float(source["probability"]) for source in d0_sources]
+    d0_groups = [tuple(source["include_groups"]) for source in d0_sources]
+    if d0_groups != [("dense_dense",), ("dense_sparse",), ("triple",)]:
+        raise RuntimeError(f"Unexpected D0 metadata groups: {d0_groups}")
+    if any(
+        abs(actual - expected) > 1e-8
+        for actual, expected in zip(d0_probabilities, (0.40, 0.35, 0.25))
+    ):
+        raise RuntimeError(f"Unexpected D0 probabilities: {d0_probabilities}")
+
+    d1 = load_config("configs/screen_d1_shared_capacity.yaml")
+    d1_model = d1["model"]
+    if (
+        int(d1_model["dense_expert_blocks"]),
+        int(d1_model["sparse_expert_blocks"]),
+        int(d1_model["shared_bottleneck_blocks"]),
+    ) != (2, 2, 4):
+        raise RuntimeError(f"Unexpected D1 capacity allocation: {d1_model}")
+    for config, name in ((d0, "D0"), (d1, "D1")):
+        auxiliary_weights = tuple(
+            float(config["loss"][key])
+            for key in ("lambda_cls", "lambda_proto", "lambda_sparse")
+        )
+        if auxiliary_weights != (0.0, 0.0, 0.0):
+            raise RuntimeError(f"{name} must retain the A1 auxiliary-loss control")
+        if int(config["optimization"]["max_iters"]) != 15000:
+            raise RuntimeError(f"{name} must remain a 15k validation screen")
+
 
 def main() -> None:
     check_sparse_mask_amp()
@@ -378,6 +499,7 @@ def main() -> None:
     check_active_macro_metrics()
     check_v11_checkpoint_compatibility()
     check_v2lite_multiscale_identity_and_gradients()
+    check_d1_shared_capacity_reallocation()
     check_v11_forward_backward()
     check_v11_configs()
     model = DSDRestoreV1(base_channels=16, token_dim=32)
@@ -422,6 +544,8 @@ def main() -> None:
     print("DSD-Restore V1.1 smoke test passed")
     print("V1.1 equivalent legacy-gate checkpoint migration: passed")
     print("V2-lite C1 identity initialization and gradients: passed")
+    print("D1 shared-capacity checkpoint migration and gradients: passed")
+    print("D0/D1 controlled-screen configs: passed")
     print("V1.1 configs: passed")
     print("sparse-mask AMP forward/backward: passed")
     print(f"restored: {tuple(outputs['restored'].shape)}")

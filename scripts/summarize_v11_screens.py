@@ -15,6 +15,8 @@ SCREEN_RUNS = (
     "v11b_screen_b1_dual_gate_migrated",
     "v11b_screen_b2_full_migrated",
     "v2lite_screen_c1_multiscale",
+    "screen_d0_triple_balance",
+    "screen_d1_shared_capacity",
 )
 
 

@@ -83,6 +83,11 @@ screens first, then train the selected candidate from Stage 1. The complete
 command sequence and TensorBoard decision criteria are in
 [`docs/V11_RUNBOOK.md`](docs/V11_RUNBOOK.md).
 
+After the V1.1 and V2-lite C1 screens, use the independent D0 sampling-balance
+and D1 shared-capacity screens before attempting a full V2. Their frozen
+controls, commands and go/no-go criteria are documented in
+[`docs/D0_D1_RUNBOOK.md`](docs/D0_D1_RUNBOOK.md).
+
 ## Data
 
 The default configuration reads each dataset in place. Do not copy everything

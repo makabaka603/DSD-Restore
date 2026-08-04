@@ -3,6 +3,7 @@ from torch import nn
 from .backbone import (
     NAFNetRestorationDecoder,
     NAFNetSharedEncoder,
+    NAFStage,
     RestorationDecoder,
     SharedEncoder,
 )
@@ -41,8 +42,15 @@ class DSDRestoreV1(nn.Module):
         multiscale_conditioning: bool = False,
         multiscale_levels: tuple[int, ...] = (1, 2, 3),
         multiscale_reduction: int = 4,
+        dense_expert_blocks: int = 4,
+        sparse_expert_blocks: int = 4,
+        shared_bottleneck_blocks: int = 0,
     ):
         super().__init__()
+        if dense_expert_blocks < 1 or sparse_expert_blocks < 1:
+            raise ValueError("Expert block counts must be at least 1")
+        if shared_bottleneck_blocks < 0:
+            raise ValueError("shared_bottleneck_blocks cannot be negative")
         backbone_type = backbone_type.lower()
         if backbone_type == "nafnet":
             self.encoder = NAFNetSharedEncoder(
@@ -55,6 +63,12 @@ class DSDRestoreV1(nn.Module):
             decoder_cls = RestorationDecoder
         else:
             raise ValueError("backbone_type must be 'nafnet' or 'simple'")
+        bottleneck_channels = self.encoder.out_channels[-1]
+        self.shared_bottleneck = (
+            NAFStage(bottleneck_channels, shared_bottleneck_blocks)
+            if shared_bottleneck_blocks > 0
+            else nn.Identity()
+        )
         self.tokenizer = DegradationTokenizer(
             self.encoder.out_channels,
             token_dim=token_dim,
@@ -79,15 +93,16 @@ class DSDRestoreV1(nn.Module):
             if multiscale_conditioning
             else None
         )
-        bottleneck_channels = self.encoder.out_channels[-1]
         self.dense_expert = DenseDegradationExpert(
             bottleneck_channels,
             token_dim,
+            num_blocks=dense_expert_blocks,
             token_pooling=token_pooling,
         )
         self.sparse_expert = SparseOcclusionExpert(
             bottleneck_channels,
             token_dim,
+            num_blocks=sparse_expert_blocks,
             token_pooling=token_pooling,
         )
         self.fusion = SimpleDenseSparseFusion(
@@ -99,6 +114,10 @@ class DSDRestoreV1(nn.Module):
 
     def forward(self, image: torch.Tensor) -> dict[str, torch.Tensor]:
         features = self.encoder(image)
+        # D1 reallocates capacity from task-specific experts to this shared path.
+        # NAFBlock beta/gamma parameters start at zero, so newly added blocks are
+        # exact identity mappings when initialized from a legacy Stage 2 model.
+        features[-1] = self.shared_bottleneck(features[-1])
         tokens = self.tokenizer(image, features)
         prototypes = self.prototype_bank(
             tokens["dense_tokens"],
